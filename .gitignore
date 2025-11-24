@@ -1,0 +1,61 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Debug
+*.dSYM/
+
+# Test artifacts
+*.test
+*.profdata
+
+# Local configuration
+*.local
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.log
+*.cache
+
+# Database files (local development)
+*.db
+*.sqlite
+*.sqlite3
+
+# Package cache (local development)
+/var/cache/apt-ng/
+/var/lib/apt-ng/
+
+# Completions (generated)
+completions/_apt-ng
+completions/apt-ng.bash
+completions/apt-ng.fish
+completions/apt-ng.zsh
+
+# Documentation build
+/book/
+/docs/_build/
+
+# Coverage
+tarpaulin-report.html
+coverage/
+
