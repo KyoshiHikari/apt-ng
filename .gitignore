@@ -30,6 +30,8 @@ Cargo.lock
 *.local
 .env
 .env.local
+# Aber .env.example sollte committed werden
+!.env.example
 
 # Temporary files
 *.tmp

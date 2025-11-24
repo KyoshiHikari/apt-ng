@@ -1,0 +1,141 @@
+#!/bin/sh
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Get user ID
+if [ -n "$EUID" ]; then 
+    userid="$EUID"
+else 
+    userid="$(id -u)"
+fi
+
+# Function to run commands with sudo if needed
+run_cmd() {
+    if [ "$userid" -ne 0 ]; then
+        set -- sudo "$@"
+    fi
+    "$@"
+}
+
+# Check if sudo is available when needed
+if [ "$userid" -ne 0 ]; then
+    type sudo >/dev/null 2>&1 || { 
+        echo "${RED}Error: sudo not installed, please run as root${NC}" >&2
+        exit 1
+    }
+fi
+
+# GitHub repository info
+REPO_URL="https://github.com/KyoshiHikari/apt-ng.git"
+REPO_NAME="apt-ng"
+INSTALL_DIR="/tmp/apt-ng-install"
+BINARY_NAME="apt-ng"
+INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
+COMPLETIONS_DIR="/usr/local/share/bash-completion/completions"
+SCRIPT_URL="https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/quick-install"
+
+echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo "${BLUE}              apt-ng Installer${NC}"
+echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Step 1: Check and install Rust/Cargo
+echo "${YELLOW}[1/5]${NC} Checking Rust installation..."
+if ! type cargo >/dev/null 2>&1; then
+    echo "${YELLOW}   Rust not found. Installing Rust...${NC}"
+    run_cmd apt-get update
+    run_cmd apt-get install -y curl build-essential pkg-config libssl-dev
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    export PATH="$HOME/.cargo/bin:$PATH"
+    echo "${GREEN}   ✓ Rust installed${NC}"
+else
+    echo "${GREEN}   ✓ Rust already installed${NC}"
+fi
+
+# Ensure cargo is in PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Step 2: Clone repository
+echo ""
+echo "${YELLOW}[2/5]${NC} Cloning repository..."
+if [ -d "$INSTALL_DIR" ]; then
+    echo "${YELLOW}   Removing existing installation directory...${NC}"
+    rm -rf "$INSTALL_DIR"
+fi
+
+if ! type git >/dev/null 2>&1; then
+    echo "${YELLOW}   Installing git...${NC}"
+    run_cmd apt-get update
+    run_cmd apt-get install -y git
+fi
+
+git clone "$REPO_URL" "$INSTALL_DIR"
+echo "${GREEN}   ✓ Repository cloned${NC}"
+
+# Step 3: Build apt-ng
+echo ""
+echo "${YELLOW}[3/5]${NC} Building apt-ng (this may take a few minutes)..."
+cd "$INSTALL_DIR"
+cargo build --release
+echo "${GREEN}   ✓ Build completed${NC}"
+
+# Step 4: Install binary
+echo ""
+echo "${YELLOW}[4/5]${NC} Installing binary..."
+run_cmd cp "$INSTALL_DIR/target/release/${BINARY_NAME}" "$INSTALL_PATH"
+run_cmd chmod +x "$INSTALL_PATH"
+echo "${GREEN}   ✓ Binary installed to ${INSTALL_PATH}${NC}"
+
+# Step 5: Install shell completions (optional)
+echo ""
+echo "${YELLOW}[5/5]${NC} Installing shell completions..."
+if [ -d "$INSTALL_DIR/completions" ]; then
+    run_cmd mkdir -p "$COMPLETIONS_DIR"
+    
+    # Bash completion
+    if [ -f "$INSTALL_DIR/completions/apt-ng.bash" ]; then
+        run_cmd cp "$INSTALL_DIR/completions/apt-ng.bash" "$COMPLETIONS_DIR/${BINARY_NAME}"
+        echo "${GREEN}   ✓ Bash completion installed${NC}"
+    fi
+    
+    # Fish completion
+    if type fish >/dev/null 2>&1 && [ -f "$INSTALL_DIR/completions/apt-ng.fish" ]; then
+        FISH_COMPLETION_DIR="/usr/local/share/fish/vendor_completions.d"
+        run_cmd mkdir -p "$FISH_COMPLETION_DIR"
+        run_cmd cp "$INSTALL_DIR/completions/apt-ng.fish" "$FISH_COMPLETION_DIR/${BINARY_NAME}.fish"
+        echo "${GREEN}   ✓ Fish completion installed${NC}"
+    fi
+    
+    # Zsh completion
+    if type zsh >/dev/null 2>&1 && [ -f "$INSTALL_DIR/completions/_apt-ng" ]; then
+        ZSH_COMPLETION_DIR="/usr/local/share/zsh/site-functions"
+        run_cmd mkdir -p "$ZSH_COMPLETION_DIR"
+        run_cmd cp "$INSTALL_DIR/completions/_apt-ng" "$ZSH_COMPLETION_DIR/_${BINARY_NAME}"
+        echo "${GREEN}   ✓ Zsh completion installed${NC}"
+    fi
+else
+    echo "${YELLOW}   ⚠ Completions directory not found, skipping...${NC}"
+fi
+
+# Cleanup
+echo ""
+echo "${YELLOW}Cleaning up...${NC}"
+rm -rf "$INSTALL_DIR"
+echo "${GREEN}   ✓ Cleanup completed${NC}"
+
+# Success message
+echo ""
+echo "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+echo "${GREEN}  ✓ apt-ng successfully installed!${NC}"
+echo "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo "  Run: ${BLUE}apt-ng --help${NC} to get started"
+echo "  Or:  ${BLUE}apt-ng update${NC} to update package index"
+echo ""

@@ -16,20 +16,36 @@
 
 ## 📦 Installation
 
-### Prerequisites
+### Quick Install (Recommended)
 
-- Rust 1.70 or higher
-- Cargo (Rust Package Manager)
+Install with a single command:
 
-### Build
+```bash
+/bin/bash -c "$(curl -sL https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/quick-install)"
+```
+
+This will:
+- Install Rust/Cargo if needed
+- Clone the repository
+- Build apt-ng
+- Install it to `/usr/local/bin/apt-ng`
+- Install shell completions
+
+### Manual Build
+
+If you prefer to build manually:
 
 ```bash
 git clone https://github.com/KyoshiHikari/apt-ng.git
 cd apt-ng
 cargo build --release
+sudo cp target/release/apt-ng /usr/local/bin/
 ```
 
-The compiled binary is located at `target/release/apt-ng`.
+### Prerequisites
+
+- Rust 1.70 or higher (installed automatically by install script)
+- Cargo (Rust Package Manager)
 
 ## 🎯 Usage
 
@@ -96,6 +112,19 @@ CLI -> Core Engine ->
 - **Signatures**: Ed25519-based signatures for repositories and packages
 
 ## 🔧 Development
+
+### Git-Authentifizierung einrichten
+
+Für automatisches Pushen zu GitHub, siehe [docs/GIT-AUTH.md](docs/GIT-AUTH.md).
+
+Kurzfassung:
+```bash
+# 1. Erstelle .env aus .env.example
+cp .env.example .env
+# 2. Füge deinen GitHub Personal Access Token in .env ein
+# 3. Richte Authentifizierung ein
+./scripts/setup-git-auth.sh
+```
 
 ### Project Structure
 
