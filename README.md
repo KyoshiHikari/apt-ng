@@ -24,7 +24,7 @@
 ### Build
 
 ```bash
-git clone https://github.com/yourusername/apt-ng.git
+git clone https://github.com/KyoshiHikari/apt-ng.git
 cd apt-ng
 cargo build --release
 ```
