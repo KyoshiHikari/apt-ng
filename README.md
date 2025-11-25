@@ -25,11 +25,15 @@ Install with a single command:
 ```
 
 This will:
-- Install Rust/Cargo if needed
-- Clone the repository
-- Build apt-ng
+- Download pre-built binary from GitHub Releases (if available for your architecture)
+- If no pre-built binary is available, it will:
+  - Install Rust/Cargo if needed
+  - Clone the repository
+  - Build apt-ng from source
 - Install it to `/usr/local/bin/apt-ng`
 - Install shell completions
+
+**Note**: Pre-built binaries are available for common architectures (x86_64, aarch64). For other architectures or if no release is available, the script will automatically build from source.
 
 ### Manual Build
 

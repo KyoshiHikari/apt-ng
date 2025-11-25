@@ -41,94 +41,172 @@ INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
 COMPLETIONS_DIR="/usr/local/share/bash-completion/completions"
 SCRIPT_URL="https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/quick-install"
 
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64) ARCH_NAME="x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) ARCH_NAME="aarch64-unknown-linux-gnu" ;;
+    armv7l) ARCH_NAME="armv7-unknown-linux-gnueabihf" ;;
+    *) ARCH_NAME="unknown" ;;
+esac
+
 echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo "${BLUE}              apt-ng Installer${NC}"
 echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Step 1: Check and install Rust/Cargo
-echo "${YELLOW}[1/5]${NC} Checking Rust installation..."
-if ! type cargo >/dev/null 2>&1; then
-    echo "${YELLOW}   Rust not found. Installing Rust...${NC}"
-    run_cmd apt-get update
-    run_cmd apt-get install -y curl build-essential pkg-config libssl-dev
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    export PATH="$HOME/.cargo/bin:$PATH"
-    echo "${GREEN}   ✓ Rust installed${NC}"
+# Try to download pre-built binary from GitHub Releases first
+DOWNLOAD_SUCCESS=false
+if [ "$ARCH_NAME" != "unknown" ]; then
+    echo "${YELLOW}[1/3]${NC} Checking for pre-built binary..."
+    
+    # Get latest release tag
+    LATEST_RELEASE=$(curl -s https://api.github.com/repos/KyoshiHikari/apt-ng/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
+    
+    if [ -n "$LATEST_RELEASE" ]; then
+        DOWNLOAD_URL="https://github.com/KyoshiHikari/apt-ng/releases/download/${LATEST_RELEASE}/apt-ng-${ARCH_NAME}"
+        TEMP_BINARY="/tmp/${BINARY_NAME}-${LATEST_RELEASE}"
+        
+        echo "${YELLOW}   Found release ${LATEST_RELEASE}, downloading binary...${NC}"
+        if curl -sLf "$DOWNLOAD_URL" -o "$TEMP_BINARY" 2>/dev/null; then
+            # Verify it's actually a binary (check for ELF magic number)
+            if [ -f "$TEMP_BINARY" ] && file "$TEMP_BINARY" | grep -q "ELF"; then
+                run_cmd cp "$TEMP_BINARY" "$INSTALL_PATH"
+                run_cmd chmod +x "$INSTALL_PATH"
+                rm -f "$TEMP_BINARY"
+                echo "${GREEN}   ✓ Pre-built binary installed${NC}"
+                DOWNLOAD_SUCCESS=true
+            else
+                echo "${YELLOW}   Downloaded file is not a valid binary, falling back to build...${NC}"
+                rm -f "$TEMP_BINARY"
+            fi
+        else
+            echo "${YELLOW}   Pre-built binary not available for ${ARCH_NAME}, falling back to build...${NC}"
+        fi
+    else
+        echo "${YELLOW}   No releases found, will build from source...${NC}"
+    fi
 else
-    echo "${GREEN}   ✓ Rust already installed${NC}"
+    echo "${YELLOW}   Architecture ${ARCH} not supported for pre-built binaries, will build from source...${NC}"
 fi
 
-# Ensure cargo is in PATH
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# Step 2: Clone repository
-echo ""
-echo "${YELLOW}[2/5]${NC} Cloning repository..."
-if [ -d "$INSTALL_DIR" ]; then
-    echo "${YELLOW}   Removing existing installation directory...${NC}"
+# If download failed, build from source
+if [ "$DOWNLOAD_SUCCESS" = false ]; then
+    echo ""
+    echo "${YELLOW}[1/5]${NC} Building from source (this may take a few minutes)..."
+    
+    # Check and install Rust/Cargo
+    echo "${YELLOW}   Checking Rust installation...${NC}"
+    if ! type cargo >/dev/null 2>&1; then
+        echo "${YELLOW}   Rust not found. Installing Rust...${NC}"
+        run_cmd apt-get update
+        run_cmd apt-get install -y curl build-essential pkg-config libssl-dev
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        export PATH="$HOME/.cargo/bin:$PATH"
+        echo "${GREEN}   ✓ Rust installed${NC}"
+    else
+        echo "${GREEN}   ✓ Rust already installed${NC}"
+    fi
+    
+    # Ensure cargo is in PATH
+    export PATH="$HOME/.cargo/bin:$PATH"
+    
+    # Clone repository
+    echo ""
+    echo "${YELLOW}[2/5]${NC} Cloning repository..."
+    if [ -d "$INSTALL_DIR" ]; then
+        echo "${YELLOW}   Removing existing installation directory...${NC}"
+        rm -rf "$INSTALL_DIR"
+    fi
+    
+    if ! type git >/dev/null 2>&1; then
+        echo "${YELLOW}   Installing git...${NC}"
+        run_cmd apt-get update
+        run_cmd apt-get install -y git
+    fi
+    
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    echo "${GREEN}   ✓ Repository cloned${NC}"
+    
+    # Build apt-ng
+    echo ""
+    echo "${YELLOW}[3/5]${NC} Building apt-ng..."
+    cd "$INSTALL_DIR"
+    cargo build --release
+    echo "${GREEN}   ✓ Build completed${NC}"
+    
+    # Install binary
+    echo ""
+    echo "${YELLOW}[4/5]${NC} Installing binary..."
+    run_cmd cp "$INSTALL_DIR/target/release/${BINARY_NAME}" "$INSTALL_PATH"
+    run_cmd chmod +x "$INSTALL_PATH"
+    echo "${GREEN}   ✓ Binary installed to ${INSTALL_PATH}${NC}"
+    
+    # Cleanup build directory
     rm -rf "$INSTALL_DIR"
 fi
 
-if ! type git >/dev/null 2>&1; then
-    echo "${YELLOW}   Installing git...${NC}"
-    run_cmd apt-get update
-    run_cmd apt-get install -y git
+# Install shell completions (optional)
+if [ "$DOWNLOAD_SUCCESS" = false ]; then
+    # Completions are already in INSTALL_DIR if we built from source
+    COMPLETIONS_SOURCE="$INSTALL_DIR/completions"
+else
+    # Download completions from GitHub if we used pre-built binary
+    echo ""
+    echo "${YELLOW}[2/4]${NC} Downloading shell completions..."
+    COMPLETIONS_SOURCE="/tmp/apt-ng-completions"
+    mkdir -p "$COMPLETIONS_SOURCE"
+    
+    # Try to download completions from GitHub
+    curl -sLf "https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/completions/apt-ng.bash" -o "$COMPLETIONS_SOURCE/apt-ng.bash" 2>/dev/null || true
+    curl -sLf "https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/completions/apt-ng.fish" -o "$COMPLETIONS_SOURCE/apt-ng.fish" 2>/dev/null || true
+    curl -sLf "https://raw.githubusercontent.com/KyoshiHikari/apt-ng/main/completions/_apt-ng" -o "$COMPLETIONS_SOURCE/_apt-ng" 2>/dev/null || true
 fi
 
-git clone "$REPO_URL" "$INSTALL_DIR"
-echo "${GREEN}   ✓ Repository cloned${NC}"
-
-# Step 3: Build apt-ng
-echo ""
-echo "${YELLOW}[3/5]${NC} Building apt-ng (this may take a few minutes)..."
-cd "$INSTALL_DIR"
-cargo build --release
-echo "${GREEN}   ✓ Build completed${NC}"
-
-# Step 4: Install binary
-echo ""
-echo "${YELLOW}[4/5]${NC} Installing binary..."
-run_cmd cp "$INSTALL_DIR/target/release/${BINARY_NAME}" "$INSTALL_PATH"
-run_cmd chmod +x "$INSTALL_PATH"
-echo "${GREEN}   ✓ Binary installed to ${INSTALL_PATH}${NC}"
-
-# Step 5: Install shell completions (optional)
-echo ""
-echo "${YELLOW}[5/5]${NC} Installing shell completions..."
-if [ -d "$INSTALL_DIR/completions" ]; then
+if [ -d "$COMPLETIONS_SOURCE" ] && [ "$(ls -A $COMPLETIONS_SOURCE 2>/dev/null)" ]; then
+    echo ""
+    if [ "$DOWNLOAD_SUCCESS" = true ]; then
+        echo "${YELLOW}[2/3]${NC} Installing shell completions..."
+    else
+        echo "${YELLOW}[5/5]${NC} Installing shell completions..."
+    fi
     run_cmd mkdir -p "$COMPLETIONS_DIR"
     
     # Bash completion
-    if [ -f "$INSTALL_DIR/completions/apt-ng.bash" ]; then
-        run_cmd cp "$INSTALL_DIR/completions/apt-ng.bash" "$COMPLETIONS_DIR/${BINARY_NAME}"
+    if [ -f "$COMPLETIONS_SOURCE/apt-ng.bash" ]; then
+        run_cmd cp "$COMPLETIONS_SOURCE/apt-ng.bash" "$COMPLETIONS_DIR/${BINARY_NAME}"
         echo "${GREEN}   ✓ Bash completion installed${NC}"
     fi
     
     # Fish completion
-    if type fish >/dev/null 2>&1 && [ -f "$INSTALL_DIR/completions/apt-ng.fish" ]; then
+    if type fish >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/apt-ng.fish" ]; then
         FISH_COMPLETION_DIR="/usr/local/share/fish/vendor_completions.d"
         run_cmd mkdir -p "$FISH_COMPLETION_DIR"
-        run_cmd cp "$INSTALL_DIR/completions/apt-ng.fish" "$FISH_COMPLETION_DIR/${BINARY_NAME}.fish"
+        run_cmd cp "$COMPLETIONS_SOURCE/apt-ng.fish" "$FISH_COMPLETION_DIR/${BINARY_NAME}.fish"
         echo "${GREEN}   ✓ Fish completion installed${NC}"
     fi
     
     # Zsh completion
-    if type zsh >/dev/null 2>&1 && [ -f "$INSTALL_DIR/completions/_apt-ng" ]; then
+    if type zsh >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/_apt-ng" ]; then
         ZSH_COMPLETION_DIR="/usr/local/share/zsh/site-functions"
         run_cmd mkdir -p "$ZSH_COMPLETION_DIR"
-        run_cmd cp "$INSTALL_DIR/completions/_apt-ng" "$ZSH_COMPLETION_DIR/_${BINARY_NAME}"
+        run_cmd cp "$COMPLETIONS_SOURCE/_apt-ng" "$ZSH_COMPLETION_DIR/_${BINARY_NAME}"
         echo "${GREEN}   ✓ Zsh completion installed${NC}"
     fi
+    
+    # Cleanup completions temp directory if we downloaded them
+    if [ "$DOWNLOAD_SUCCESS" = true ]; then
+        rm -rf "$COMPLETIONS_SOURCE"
+    fi
 else
-    echo "${YELLOW}   ⚠ Completions directory not found, skipping...${NC}"
+    if [ "$DOWNLOAD_SUCCESS" = true ]; then
+        echo ""
+        echo "${YELLOW}[2/3]${NC} Shell completions not available, skipping...${NC}"
+    else
+        echo ""
+        echo "${YELLOW}[5/5]${NC} Shell completions not found, skipping...${NC}"
+    fi
 fi
-
-# Cleanup
-echo ""
-echo "${YELLOW}Cleaning up...${NC}"
-rm -rf "$INSTALL_DIR"
-echo "${GREEN}   ✓ Cleanup completed${NC}"
 
 # Success message
 echo ""
