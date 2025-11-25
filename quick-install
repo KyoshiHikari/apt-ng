@@ -2,12 +2,24 @@
 
 set -e
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Detect if we're in a terminal that supports colors
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    # Terminal supports colors
+    RED=$(tput setaf 1)
+    GREEN=$(tput setaf 2)
+    YELLOW=$(tput setaf 3)
+    BLUE=$(tput setaf 4)
+    BOLD=$(tput bold)
+    NC=$(tput sgr0) # No Color
+else
+    # No color support or not a terminal
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    BOLD=''
+    NC=''
+fi
 
 # Get user ID
 if [ -n "$EUID" ]; then 
@@ -51,14 +63,14 @@ case "$ARCH" in
 esac
 
 echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-echo "${BLUE}              apt-ng Installer${NC}"
+echo "${BLUE}${BOLD}              apt-ng Installer${NC}"
 echo "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
 
 # Try to download pre-built binary from GitHub Releases first
 DOWNLOAD_SUCCESS=false
 if [ "$ARCH_NAME" != "unknown" ]; then
-    echo "${YELLOW}[1/3]${NC} Checking for pre-built binary..."
+    echo "${YELLOW}${BOLD}[1/3]${NC} Checking for pre-built binary..."
     
     # Get latest release tag
     LATEST_RELEASE=$(curl -s https://api.github.com/repos/KyoshiHikari/apt-ng/releases/latest 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
@@ -74,7 +86,7 @@ if [ "$ARCH_NAME" != "unknown" ]; then
                 run_cmd cp "$TEMP_BINARY" "$INSTALL_PATH"
                 run_cmd chmod +x "$INSTALL_PATH"
                 rm -f "$TEMP_BINARY"
-                echo "${GREEN}   ✓ Pre-built binary installed${NC}"
+                echo "${GREEN}   ✓${NC} Pre-built binary installed"
                 DOWNLOAD_SUCCESS=true
             else
                 echo "${YELLOW}   Downloaded file is not a valid binary, falling back to build...${NC}"
@@ -93,7 +105,7 @@ fi
 # If download failed, build from source
 if [ "$DOWNLOAD_SUCCESS" = false ]; then
     echo ""
-    echo "${YELLOW}[1/5]${NC} Building from source (this may take a few minutes)..."
+    echo "${YELLOW}${BOLD}[1/5]${NC} Building from source (this may take a few minutes)..."
     
     # Check and install Rust/Cargo
     echo "${YELLOW}   Checking Rust installation...${NC}"
@@ -103,9 +115,9 @@ if [ "$DOWNLOAD_SUCCESS" = false ]; then
         run_cmd apt-get install -y curl build-essential pkg-config libssl-dev
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         export PATH="$HOME/.cargo/bin:$PATH"
-        echo "${GREEN}   ✓ Rust installed${NC}"
+        echo "${GREEN}   ✓${NC} Rust installed"
     else
-        echo "${GREEN}   ✓ Rust already installed${NC}"
+        echo "${GREEN}   ✓${NC} Rust already installed"
     fi
     
     # Ensure cargo is in PATH
@@ -113,7 +125,7 @@ if [ "$DOWNLOAD_SUCCESS" = false ]; then
     
     # Clone repository
     echo ""
-    echo "${YELLOW}[2/5]${NC} Cloning repository..."
+    echo "${YELLOW}${BOLD}[2/5]${NC} Cloning repository..."
     if [ -d "$INSTALL_DIR" ]; then
         echo "${YELLOW}   Removing existing installation directory...${NC}"
         rm -rf "$INSTALL_DIR"
@@ -126,21 +138,21 @@ if [ "$DOWNLOAD_SUCCESS" = false ]; then
     fi
     
     git clone "$REPO_URL" "$INSTALL_DIR"
-    echo "${GREEN}   ✓ Repository cloned${NC}"
+    echo "${GREEN}   ✓${NC} Repository cloned"
     
     # Build apt-ng
     echo ""
-    echo "${YELLOW}[3/5]${NC} Building apt-ng..."
+    echo "${YELLOW}${BOLD}[3/5]${NC} Building apt-ng..."
     cd "$INSTALL_DIR"
     cargo build --release
-    echo "${GREEN}   ✓ Build completed${NC}"
+    echo "${GREEN}   ✓${NC} Build completed"
     
     # Install binary
     echo ""
-    echo "${YELLOW}[4/5]${NC} Installing binary..."
+    echo "${YELLOW}${BOLD}[4/5]${NC} Installing binary..."
     run_cmd cp "$INSTALL_DIR/target/release/${BINARY_NAME}" "$INSTALL_PATH"
     run_cmd chmod +x "$INSTALL_PATH"
-    echo "${GREEN}   ✓ Binary installed to ${INSTALL_PATH}${NC}"
+    echo "${GREEN}   ✓${NC} Binary installed to ${INSTALL_PATH}"
     
     # Cleanup build directory
     rm -rf "$INSTALL_DIR"
@@ -166,32 +178,33 @@ fi
 if [ -d "$COMPLETIONS_SOURCE" ] && [ "$(ls -A $COMPLETIONS_SOURCE 2>/dev/null)" ]; then
     echo ""
     if [ "$DOWNLOAD_SUCCESS" = true ]; then
-        echo "${YELLOW}[2/3]${NC} Installing shell completions..."
+        echo "${YELLOW}${BOLD}[2/3]${NC} Installing shell completions..."
     else
-        echo "${YELLOW}[5/5]${NC} Installing shell completions..."
+        echo "${YELLOW}${BOLD}[5/5]${NC} Installing shell completions..."
     fi
     run_cmd mkdir -p "$COMPLETIONS_DIR"
     
     # Bash completion
     if [ -f "$COMPLETIONS_SOURCE/apt-ng.bash" ]; then
+        run_cmd mkdir -p "$COMPLETIONS_DIR"
         run_cmd cp "$COMPLETIONS_SOURCE/apt-ng.bash" "$COMPLETIONS_DIR/${BINARY_NAME}"
-        echo "${GREEN}   ✓ Bash completion installed${NC}"
+        echo "${GREEN}   ✓${NC} Bash completion installed"
     fi
     
     # Fish completion
-    if type fish >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/apt-ng.fish" ]; then
+    if command -v fish >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/apt-ng.fish" ]; then
         FISH_COMPLETION_DIR="/usr/local/share/fish/vendor_completions.d"
         run_cmd mkdir -p "$FISH_COMPLETION_DIR"
         run_cmd cp "$COMPLETIONS_SOURCE/apt-ng.fish" "$FISH_COMPLETION_DIR/${BINARY_NAME}.fish"
-        echo "${GREEN}   ✓ Fish completion installed${NC}"
+        echo "${GREEN}   ✓${NC} Fish completion installed"
     fi
     
     # Zsh completion
-    if type zsh >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/_apt-ng" ]; then
+    if command -v zsh >/dev/null 2>&1 && [ -f "$COMPLETIONS_SOURCE/_apt-ng" ]; then
         ZSH_COMPLETION_DIR="/usr/local/share/zsh/site-functions"
         run_cmd mkdir -p "$ZSH_COMPLETION_DIR"
         run_cmd cp "$COMPLETIONS_SOURCE/_apt-ng" "$ZSH_COMPLETION_DIR/_${BINARY_NAME}"
-        echo "${GREEN}   ✓ Zsh completion installed${NC}"
+        echo "${GREEN}   ✓${NC} Zsh completion installed"
     fi
     
     # Cleanup completions temp directory if we downloaded them
@@ -201,17 +214,17 @@ if [ -d "$COMPLETIONS_SOURCE" ] && [ "$(ls -A $COMPLETIONS_SOURCE 2>/dev/null)" 
 else
     if [ "$DOWNLOAD_SUCCESS" = true ]; then
         echo ""
-        echo "${YELLOW}[2/3]${NC} Shell completions not available, skipping...${NC}"
+        echo "${YELLOW}${BOLD}[2/3]${NC} Shell completions not available, skipping..."
     else
         echo ""
-        echo "${YELLOW}[5/5]${NC} Shell completions not found, skipping...${NC}"
+        echo "${YELLOW}${BOLD}[5/5]${NC} Shell completions not found, skipping..."
     fi
 fi
 
 # Success message
 echo ""
 echo "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
-echo "${GREEN}  ✓ apt-ng successfully installed!${NC}"
+echo "${GREEN}${BOLD}  ✓ apt-ng successfully installed!${NC}"
 echo "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo "  Run: ${BLUE}apt-ng --help${NC} to get started"
