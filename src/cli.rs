@@ -48,7 +48,7 @@ const HELP_TEMPLATE: &str = "\
     Show package information:\n\
       $ apt-ng show nginx\n\
     \n\
-    For more information, visit: https://github.com/apt-ng/apt-ng"
+    For more information, visit: https://github.com/KyoshiHikari/apt-ng"
 )]
 pub struct Cli {
     #[command(subcommand)]
