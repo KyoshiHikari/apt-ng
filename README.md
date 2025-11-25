@@ -117,16 +117,16 @@ CLI -> Core Engine ->
 
 ## 🔧 Development
 
-### Git-Authentifizierung einrichten
+### Setting up Git Authentication
 
-Für automatisches Pushen zu GitHub, siehe [docs/GIT-AUTH.md](docs/GIT-AUTH.md).
+For automatic pushing to GitHub, see [docs/GIT-AUTH.md](docs/GIT-AUTH.md).
 
-Kurzfassung:
+Quick setup:
 ```bash
-# 1. Erstelle .env aus .env.example
+# 1. Create .env from .env.example
 cp .env.example .env
-# 2. Füge deinen GitHub Personal Access Token in .env ein
-# 3. Richte Authentifizierung ein
+# 2. Add your GitHub Personal Access Token to .env
+# 3. Set up authentication
 ./scripts/setup-git-auth.sh
 ```
 
