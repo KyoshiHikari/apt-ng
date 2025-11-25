@@ -137,7 +137,6 @@ apt-ng/
 │   ├── system.rs        # System Detection
 │   └── output.rs        # Formatted Output
 ├── docs/
-│   ├── INSTRUCTION.md   # Technical Design
 │   └── FUNCTIONS-LIST.md # Feature Status
 └── Cargo.toml
 ```
