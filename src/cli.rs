@@ -171,6 +171,16 @@ pub enum Commands {
     /// size management.
     #[command(subcommand)]
     Cache(CacheAction),
+    
+    /// Security audit
+    ///
+    /// Run security checks and generate security audit reports.
+    ///
+    /// Examples:
+    ///   $ apt-ng security audit
+    ///   $ apt-ng security audit --json
+    #[command(subcommand)]
+    Security(SecurityCommands),
 }
 
 #[derive(Subcommand)]
@@ -198,6 +208,19 @@ pub enum RepoCommands {
     ///   $ apt-ng repo update
     ///   $ apt-ng repo update -v  # Verbose output
     Update,
+}
+
+#[derive(Subcommand)]
+pub enum SecurityCommands {
+    /// Run security audit
+    ///
+    /// Performs comprehensive security checks including signature verification,
+    /// sandbox configuration, and input validation checks.
+    Audit {
+        /// Output format (text or json)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]

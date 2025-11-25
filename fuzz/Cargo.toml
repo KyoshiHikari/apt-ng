@@ -1,0 +1,26 @@
+[package]
+name = "apt-ng-fuzz"
+version = "0.0.0"
+authors = ["AutoFuzz <a@b.c>"]
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+apt-ng = { path = ".." }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "fuzz_packages_parser"
+path = "fuzz_targets/fuzz_packages_parser.rs"
+
+[[bin]]
+name = "fuzz_apx_parser"
+path = "fuzz_targets/fuzz_apx_parser.rs"
+
+[[bin]]
+name = "fuzz_dependency_parser"
+path = "fuzz_targets/fuzz_dependency_parser.rs"
+

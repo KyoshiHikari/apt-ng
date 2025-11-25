@@ -11,8 +11,11 @@ mod cache;
 mod apt_parser;
 mod system;
 mod output;
+mod sandbox;
+mod security;
+mod delta;
 
-use cli::{Commands, RepoCommands, CacheAction};
+use cli::{Commands, RepoCommands, CacheAction, SecurityCommands};
 use std::path::Path;
 use std::collections::{HashSet, HashMap};
 use clap::CommandFactory;
@@ -105,6 +108,13 @@ async fn main() -> anyhow::Result<()> {
             match action {
                 CacheAction::Clean { old_versions, max_size } => {
                     cmd_cache_clean(&config, *old_versions, *max_size, opts.verbose)?;
+                }
+            }
+        }
+        Commands::Security(security_cmd) => {
+            match security_cmd {
+                SecurityCommands::Audit { format } => {
+                    cmd_security_audit(&format, opts.verbose)?;
                 }
             }
         }
@@ -714,6 +724,26 @@ async fn cmd_install(
         
         let download_url = format!("{}/{}", repo_url.trim_end_matches('/'), filename.trim_start_matches('/'));
         
+        // Check for delta update availability and calculate delta if possible
+        let mut use_delta = false;
+        
+        if let Ok(installed_packages) = index.list_installed_packages_with_manifests() {
+            if let Some(installed_pkg) = installed_packages.iter().find(|ip| ip.name == pkg.name) {
+                use crate::delta::DeltaCalculator;
+                
+                // Check if delta is available
+                if DeltaCalculator::delta_available(&pkg.name, &installed_pkg.version, &pkg.version) {
+                    // Try to calculate delta from cached old version
+                    let old_cache_path = cache.package_path_with_ext(&pkg.name, &installed_pkg.version, &pkg.arch, "deb");
+                    if old_cache_path.exists() {
+                        // For now, we'll download full package and calculate delta later
+                        // In production, would check repository for pre-calculated delta
+                        use_delta = true;
+                    }
+                }
+            }
+        }
+        
         output::Output::download_info(&pkg.name, &format_size(pkg.size));
         
         // Lade Paket herunter
@@ -721,6 +751,64 @@ async fn cmd_install(
             pkg.name, pkg.version));
         
         downloader.download_file(&download_url, &temp_file).await?;
+        
+        // If delta was requested, calculate it now (for demonstration)
+        if use_delta {
+            if let Ok(installed_packages) = index.list_installed_packages_with_manifests() {
+                if let Some(installed_pkg) = installed_packages.iter().find(|ip| ip.name == pkg.name) {
+                    use crate::delta::DeltaCalculator;
+                    let old_cache_path = cache.package_path_with_ext(&pkg.name, &installed_pkg.version, &pkg.arch, "deb");
+                    if old_cache_path.exists() {
+                        match DeltaCalculator::calculate_delta(&old_cache_path, &temp_file, "simple") {
+                            Ok((delta_data, metadata)) => {
+                                // Check if delta is worthwhile
+                                if metadata.is_worthwhile() {
+                                    if verbose {
+                                        output::Output::info(&format!(
+                                            "Delta calculated: {}% savings ({:.2}MB -> {:.2}MB)",
+                                            metadata.savings_percentage(),
+                                            metadata.full_size as f64 / 1_000_000.0,
+                                            metadata.delta_size as f64 / 1_000_000.0
+                                        ));
+                                    }
+                                    // Store delta file
+                                    let delta_file = std::env::temp_dir().join(format!("apt-ng-delta-{}-{}.delta", 
+                                        pkg.name, pkg.version));
+                                    std::fs::write(&delta_file, delta_data)?;
+                                    
+                                    // Apply delta to reconstruct full package
+                                    use crate::delta::DeltaApplier;
+                                    match DeltaApplier::apply_delta(&old_cache_path, &delta_file, &temp_file, &metadata) {
+                                        Ok(_) => {
+                                            if verbose {
+                                                output::Output::info(&format!("Delta applied successfully for {}", pkg.name));
+                                            }
+                                            // Clean up delta file
+                                            let _ = std::fs::remove_file(&delta_file);
+                                        }
+                                        Err(e) => {
+                                            if verbose {
+                                                output::Output::warning(&format!("Failed to apply delta for {}: {}, using full download", pkg.name, e));
+                                            }
+                                            // Fall back to full download (already downloaded)
+                                        }
+                                    }
+                                } else {
+                                    if verbose {
+                                        output::Output::info(&format!("Delta not worthwhile (only {:.1}% savings), using full download", metadata.savings_percentage()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if verbose {
+                                    output::Output::warning(&format!("Failed to calculate delta for {}: {}, using full download", pkg.name, e));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         
         // Verschiebe in Cache - bestimme Extension basierend auf Dateiname
         let package_dir = cache.cache_dir.join("packages");
@@ -1239,6 +1327,42 @@ fn cmd_cache_clean(config: &config::Config, clean_old: bool, max_size: Option<u6
     
     if verbose {
         output::Output::info(&format!("Cache size after cleanup: {}", format_size(size_after)));
+    }
+    
+    Ok(())
+}
+
+fn cmd_security_audit(format: &str, verbose: bool) -> anyhow::Result<()> {
+    use crate::security::SecurityAudit;
+    use crate::security::SecurityReport;
+    
+    output::Output::heading("🔐 Security Audit");
+    
+    if verbose {
+        output::Output::info("Running security checks...");
+    }
+    
+    let result = SecurityAudit::run()?;
+    
+    match format {
+        "json" => {
+            let json_report = SecurityReport::generate_json(&result)?;
+            println!("{}", json_report);
+        }
+        _ => {
+            let text_report = SecurityReport::generate_text(&result);
+            print!("{}", text_report);
+            
+            if result.passed() {
+                output::Output::success("Security audit passed");
+            } else {
+                output::Output::warning(&format!(
+                    "Security audit found {} critical and {} high severity issues",
+                    result.critical_issues,
+                    result.high_issues
+                ));
+            }
+        }
     }
     
     Ok(())

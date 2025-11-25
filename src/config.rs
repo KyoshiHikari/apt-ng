@@ -8,6 +8,15 @@ pub struct Config {
     pub paths: Paths,
     pub jobs: Option<usize>,
     pub repos: Vec<RepoConfig>,
+    pub sandbox: Option<SandboxConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub network_allowed: bool,
+    pub memory_limit: Option<u64>, // in Bytes
+    pub cpu_limit: Option<f64>,     // z.B. 0.5 für 50%
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +50,12 @@ impl Default for Config {
             },
             jobs: None,
             repos: Vec::new(),
+            sandbox: Some(SandboxConfig {
+                enabled: true,
+                network_allowed: false,
+                memory_limit: Some(512 * 1024 * 1024), // 512 MB default
+                cpu_limit: Some(1.0),                  // 100% CPU default
+            }),
         }
     }
 }

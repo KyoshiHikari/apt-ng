@@ -64,3 +64,6 @@ coverage/
 # Local versioning documentation (not for repository)
 VERSIONING.md
 
+# Local planning documentation (not for repository)
+docs/PLANNED.md
+

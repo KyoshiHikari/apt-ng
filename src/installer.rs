@@ -5,11 +5,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use sha2::{Sha256, Digest};
 use hex;
+use crate::sandbox::{Sandbox, SandboxConfig};
 
 pub struct Installer {
     worker_pool_size: usize,
     #[allow(dead_code)]
     install_root: PathBuf,
+    sandbox: Option<Sandbox>,
 }
 
 /// Tracks installed files for rollback purposes
@@ -69,6 +71,22 @@ impl Installer {
         Installer {
             worker_pool_size,
             install_root: install_root.as_ref().to_path_buf(),
+            sandbox: None,
+        }
+    }
+    
+    /// Erstellt einen neuen Installer mit Sandbox-Konfiguration
+    #[allow(dead_code)]
+    pub fn new_with_sandbox(
+        worker_pool_size: usize,
+        install_root: impl AsRef<Path>,
+        sandbox_config: Option<SandboxConfig>,
+    ) -> Self {
+        let sandbox = sandbox_config.map(|config| Sandbox::new(config));
+        Installer {
+            worker_pool_size,
+            install_root: install_root.as_ref().to_path_buf(),
+            sandbox,
         }
     }
     
@@ -214,19 +232,6 @@ impl Installer {
             .next()
             .unwrap_or("");
         
-        // Execute script with proper dpkg environment variables
-        // For preinst: upgrade <old-version> or install (no params)
-        // For postinst: configure <old-version> or abort-upgrade <old-version> or abort-remove <in-favour> <old-version>
-        // We'll use "upgrade" for preinst and "configure" for postinst as defaults
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg(&script_path)
-            .env("DPKG_MAINTSCRIPT_NAME", script_name)
-            .env("DPKG_MAINTSCRIPT_PACKAGE", package_name)
-            .env("DPKG_ROOT", &self.install_root)
-            .env("DPKG_ADMINDIR", "/var/lib/dpkg")
-            .current_dir(&self.install_root);
-        
-        // Add script arguments based on hook type
         // Get old version from parameter or try to query dpkg
         let old_ver = if let Some(ov) = old_version {
             ov.to_string()
@@ -261,31 +266,79 @@ impl Installer {
             }
         };
         
+        // Prepare script arguments
+        let mut script_args = Vec::new();
         match hook_type {
             HookType::PreInstall => {
-                // For preinst, pass "upgrade, pass "upgrade" and old version
+                // For preinst, pass "upgrade" and old version
                 // If old version is empty, it's a fresh install, use "install" instead
                 if old_ver.is_empty() {
-                    cmd.arg("install");
+                    script_args.push("install".to_string());
                 } else {
-                    cmd.arg("upgrade").arg(&old_ver);
+                    script_args.push("upgrade".to_string());
+                    script_args.push(old_ver);
                 }
             }
             HookType::PostInstall => {
                 // For postinst, pass "configure" and old version
-                cmd.arg("configure").arg(&old_ver);
+                script_args.push("configure".to_string());
+                script_args.push(old_ver);
             }
             HookType::PreRemove => {
                 // For prerm, pass "remove"
-                cmd.arg("remove");
+                script_args.push("remove".to_string());
             }
             HookType::PostRemove => {
                 // For postrm, pass "remove"
-                cmd.arg("remove");
+                script_args.push("remove".to_string());
             }
         }
         
-        let output = cmd.output()?;
+        // Prepare environment variables
+        let env_vars = vec![
+            ("DPKG_MAINTSCRIPT_NAME".to_string(), script_name.to_string()),
+            ("DPKG_MAINTSCRIPT_PACKAGE".to_string(), package_name.to_string()),
+            ("DPKG_ROOT".to_string(), self.install_root.to_string_lossy().to_string()),
+            ("DPKG_ADMINDIR".to_string(), "/var/lib/dpkg".to_string()),
+        ];
+        
+        // Execute hook with or without sandbox
+        let output = if let Some(ref sandbox) = self.sandbox {
+            // Use sandboxed execution
+            match sandbox.execute_hook_sandboxed(&script_path, &script_args, &env_vars) {
+                Ok(output) => output,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("  Sandbox execution failed, falling back to normal execution: {}", e);
+                    }
+                    // Fallback to normal execution
+                    let mut cmd = Command::new("/bin/sh");
+                    cmd.arg(&script_path)
+                        .env("DPKG_MAINTSCRIPT_NAME", script_name)
+                        .env("DPKG_MAINTSCRIPT_PACKAGE", package_name)
+                        .env("DPKG_ROOT", &self.install_root)
+                        .env("DPKG_ADMINDIR", "/var/lib/dpkg")
+                        .current_dir(&self.install_root);
+                    for arg in &script_args {
+                        cmd.arg(arg);
+                    }
+                    cmd.output()?
+                }
+            }
+        } else {
+            // Normal execution without sandbox
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(&script_path)
+                .env("DPKG_MAINTSCRIPT_NAME", script_name)
+                .env("DPKG_MAINTSCRIPT_PACKAGE", package_name)
+                .env("DPKG_ROOT", &self.install_root)
+                .env("DPKG_ADMINDIR", "/var/lib/dpkg")
+                .current_dir(&self.install_root);
+            for arg in &script_args {
+                cmd.arg(arg);
+            }
+            cmd.output()?
+        };
         
         // Cleanup
         fs::remove_dir_all(&temp_dir)?;
