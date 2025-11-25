@@ -14,6 +14,7 @@ mod output;
 
 use cli::{Commands, RepoCommands, CacheAction};
 use std::path::Path;
+use std::collections::{HashSet, HashMap};
 use clap::CommandFactory;
 
 fn format_size(bytes: u64) -> String {
@@ -538,11 +539,166 @@ async fn cmd_install(
     let cache = cache::Cache::new(config.cache_path())?;
     
     for pkg in &packages_to_install {
-        let cache_path = cache.package_path(&pkg.name, &pkg.version, &pkg.arch);
+        // Check if package exists in cache and validate it's not corrupted
+        let cache_path_deb = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "deb");
+        let cache_path_apx = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "apx");
         
-        if cache.has_package(&pkg.name, &pkg.version, &pkg.arch) {
+        let package_in_cache = if cache_path_deb.exists() {
+            // Try to validate the .deb file by checking if dpkg-deb can read it
+            let test_output = std::process::Command::new("dpkg-deb")
+                .arg("-I")
+                .arg(&cache_path_deb)
+                .output();
+            
+            let dpkg_valid = if let Ok(output) = test_output {
+                output.status.success()
+            } else {
+                false
+            };
+            
+            // Also check checksum if available
+            let checksum_valid = if !pkg.checksum.is_empty() {
+                use sha2::{Sha256, Digest};
+                use hex;
+                if let Ok(package_data) = std::fs::read(&cache_path_deb) {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&package_data);
+                    let calculated_checksum = hex::encode(hasher.finalize());
+                    calculated_checksum == pkg.checksum
+                } else {
+                    false
+                }
+            } else {
+                true // No checksum to validate
+            };
+            
+            // If file is corrupted (dpkg can't read it or checksum mismatch), delete it
+            if !dpkg_valid || !checksum_valid {
+                if verbose {
+                    if !dpkg_valid {
+                        output::Output::warning(&format!("Package {} in cache is corrupted (dpkg-deb failed), deleting...", pkg.name));
+                    } else {
+                        output::Output::warning(&format!("Package {} in cache has checksum mismatch, deleting...", pkg.name));
+                    }
+                }
+                let _ = std::fs::remove_file(&cache_path_deb);
+                false // Not in cache (anymore)
+            } else {
+                true // Valid package in cache
+            }
+        } else if cache_path_apx.exists() {
+            true // Assume .apx files are valid if they exist
+        } else {
+            false
+        };
+        
+        if package_in_cache {
             output::Output::info(&format!("Package {} already in cache", pkg.name));
             continue;
+        }
+        
+        // Skip packages without filename - they might be virtual packages or already installed
+        if pkg.filename.is_none() {
+            // Check if package is already installed on the system
+            let output = std::process::Command::new("dpkg-query")
+                .arg("-W")
+                .arg("-f=${Status}")
+                .arg(&pkg.name)
+                .output();
+            
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.contains("installed") {
+                        output::Output::info(&format!("Package {} is already installed, skipping download", pkg.name));
+                        continue;
+                    }
+                }
+            }
+            
+            // Try to get filename from apt-cache as fallback
+            let mut found_filename = None;
+            
+            // Try apt-cache show and find matching version
+            let output = std::process::Command::new("apt-cache")
+                .arg("show")
+                .arg(&pkg.name)
+                .output();
+            
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let mut in_correct_version = false;
+                    let mut fallback_filename = None;
+                    let mut fallback_version = None;
+                    
+                    for line in stdout.lines() {
+                        if line.starts_with("Package:") {
+                            in_correct_version = false;
+                        } else if line.starts_with("Version:") {
+                            let version = line.split(':').nth(1).map(|s| s.trim().to_string());
+                            if let Some(version) = version {
+                                in_correct_version = version == pkg.version;
+                                // Store first available version as fallback
+                                if fallback_filename.is_none() {
+                                    fallback_version = Some(version);
+                                }
+                            }
+                        } else if line.starts_with("Filename:") {
+                            let filename = line.split(':').nth(1).map(|s| s.trim().to_string());
+                            if let Some(filename) = filename {
+                                if in_correct_version {
+                                    found_filename = Some(filename);
+                                    break;
+                                } else if fallback_filename.is_none() {
+                                    fallback_filename = Some(filename);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Use fallback if exact version not found
+                    if found_filename.is_none() && fallback_filename.is_some() {
+                        found_filename = fallback_filename;
+                        if verbose {
+                            output::Output::warning(&format!(
+                                "Package {} version {} not found in apt-cache, using version {} instead",
+                                pkg.name, pkg.version, fallback_version.as_ref().unwrap_or(&"unknown".to_string())
+                            ));
+                        }
+                    }
+                }
+            }
+            
+            if let Some(filename) = found_filename {
+                // Use the filename from apt-cache
+                let repo_id = pkg.repo_id.ok_or_else(|| {
+                    anyhow::anyhow!("Package {} has no repository ID", pkg.name)
+                })?;
+                
+                let repo_url = index.get_repo_url(repo_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Repository {} not found", repo_id))?;
+                
+                let download_url = format!("{}/{}", repo_url.trim_end_matches('/'), filename.trim_start_matches('/'));
+                
+                output::Output::download_info(&pkg.name, &format_size(pkg.size));
+                
+                let temp_file = std::env::temp_dir().join(format!("apt-ng-download-{}-{}.tmp", 
+                    pkg.name, pkg.version));
+                
+                downloader.download_file(&download_url, &temp_file).await?;
+                
+                let package_dir = cache.cache_dir.join("packages");
+                std::fs::create_dir_all(&package_dir)?;
+                
+                let ext = filename.split('.').last().unwrap_or("deb");
+                let cache_path_with_ext = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, ext);
+                std::fs::copy(&temp_file, &cache_path_with_ext)?;
+                std::fs::remove_file(&temp_file)?;
+                continue;
+            }
+            
+            return Err(anyhow::anyhow!("Package {} has no filename and could not be found in apt-cache", pkg.name));
         }
         
         // Konstruiere Download-URL
@@ -631,11 +787,16 @@ async fn cmd_install(
                     let calculated_checksum = hex::encode(hasher.finalize());
                     
                     if calculated_checksum != pkg.checksum {
-                        return Err(anyhow::anyhow!(
-                            "Checksum mismatch for {}: expected {}, got {}",
+                        // File is corrupted, delete it
+                        output::Output::warning(&format!(
+                            "Checksum mismatch for {}: expected {}, got {}. Deleting corrupted file...",
                             pkg.name,
                             pkg.checksum,
                             calculated_checksum
+                        ));
+                        let _ = std::fs::remove_file(&cache_path);
+                        return Err(anyhow::anyhow!(
+                            "Package file corrupted (checksum mismatch). Please run the command again to re-download."
                         ));
                     }
                     
@@ -737,8 +898,8 @@ async fn cmd_upgrade(
     let mut packages_to_upgrade = Vec::new();
     
     for installed_pkg in &installed_packages {
-        // Get latest available version
-        let available_packages = index.search(&installed_pkg.name)?;
+        // Get latest available version (exact match only for upgrades)
+        let available_packages = index.search_exact(&installed_pkg.name)?;
         
         if let Some(latest_pkg) = available_packages.first() {
             // Compare versions using solver's version comparison
@@ -787,6 +948,7 @@ async fn cmd_upgrade(
     let all_available_packages = index.get_all_packages()?;
     let mut solver = solver::DependencySolver::new();
     
+    // Add available packages to solver
     for manifest in &all_available_packages {
         match solver::DependencySolver::manifest_to_package_info(manifest) {
             Ok(pkg_info) => {
@@ -799,6 +961,36 @@ async fn cmd_upgrade(
             }
         }
     }
+    
+    // Add installed packages to solver so dependencies already satisfied by installed packages can be found
+    for manifest in &installed_packages {
+        match solver::DependencySolver::manifest_to_package_info(manifest) {
+            Ok(pkg_info) => {
+                solver.add_package(pkg_info);
+            }
+            Err(e) => {
+                if verbose {
+                    output::Output::warning(&format!("Failed to parse dependencies for installed package {}: {}", manifest.name, e));
+                }
+            }
+        }
+    }
+    
+    // Tell the solver which packages are already installed so it can skip resolving their dependencies
+    let installed_package_names: HashSet<String> = installed_packages.iter()
+        .map(|p| p.name.clone())
+        .collect();
+    
+    // Debug: Check if any installed dependencies that need libqt5core5t64
+    if verbose {
+        for pkg in &installed_packages {
+            if !pkg.provides.is_empty() {
+                output::Output::info(&format!("Installed package {} provides: {:?}", pkg.name, pkg.provides));
+            }
+        }
+    }
+    
+    solver.set_installed_packages(installed_package_names);
     
     let upgrade_specs: Vec<solver::PackageSpec> = packages_to_upgrade.iter()
         .map(|p| solver::PackageSpec {
@@ -817,20 +1009,82 @@ async fn cmd_upgrade(
         }
     };
     
-    if solution.to_install.is_empty() && solution.to_upgrade.is_empty() {
+    if verbose {
+        output::Output::info(&format!("Solver returned {} packages to install, {} to upgrade", 
+            solution.to_install.len(), solution.to_upgrade.len()));
+        for pkg in &solution.to_install {
+            output::Output::info(&format!("  - {} {}", pkg.name, pkg.version));
+        }
+    }
+    
+    // Separate packages into to_install and to_upgrade based on whether they're already installed
+    let installed_package_map: HashMap<String, String> = installed_packages.iter()
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    
+    let mut packages_to_install = Vec::new();
+    let mut packages_to_upgrade = Vec::new();
+    
+    for pkg in solution.to_install {
+        if let Some(installed_version) = installed_package_map.get(&pkg.name) {
+            // Package is already installed - check if version is different
+            use crate::solver::DependencySolver;
+            let comparison = DependencySolver::compare_versions(&pkg.version, installed_version);
+            match comparison {
+                std::cmp::Ordering::Greater => {
+                    // Newer version available - add to upgrade list
+                    packages_to_upgrade.push(pkg);
+                }
+                std::cmp::Ordering::Equal => {
+                    // Same version - skip (already installed)
+                    if verbose {
+                        output::Output::info(&format!("Package {} {} is already installed, skipping", pkg.name, pkg.version));
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    // Older version - shouldn't happen, but skip it
+                    if verbose {
+                        output::Output::warning(&format!("Package {} {} is older than installed version {}, skipping", pkg.name, pkg.version, installed_version));
+                    }
+                }
+            }
+        } else {
+            // Package is not installed - add to install list
+            packages_to_install.push(pkg);
+        }
+    }
+    
+    // Add packages from solution.to_upgrade (if any)
+    packages_to_upgrade.extend(solution.to_upgrade);
+    
+    if packages_to_install.is_empty() && packages_to_upgrade.is_empty() {
         output::Output::info("No packages to install or upgrade after dependency resolution.");
         return Ok(());
     }
     
     if verbose {
-        output::Output::section("📋 Packages to upgrade:");
-        for pkg in &solution.to_install {
-            output::Output::list_item(&format!("{} ({})", pkg.name, pkg.version));
+        if !packages_to_upgrade.is_empty() {
+            output::Output::section("📋 Packages to upgrade:");
+            for pkg in &packages_to_upgrade {
+                output::Output::list_item(&format!("{} ({})", pkg.name, pkg.version));
+            }
+        }
+        if !packages_to_install.is_empty() {
+            output::Output::section("📋 Packages to install:");
+            for pkg in &packages_to_install {
+                output::Output::list_item(&format!("{} ({})", pkg.name, pkg.version));
+            }
         }
     }
     
+    // Combine both lists for installation (install logic handles both new installs and upgrades)
+    let all_packages: Vec<String> = packages_to_install.iter()
+        .chain(packages_to_upgrade.iter())
+        .map(|p| p.name.clone())
+        .collect();
+    
     // 3. Use install logic for upgrades (it handles dependencies automatically)
-    cmd_install(index, config, &solution.to_install.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), jobs, false, verbose).await?;
+    cmd_install(index, config, &all_packages, jobs, false, verbose).await?;
     
     output::Output::success(&format!("Successfully upgraded {} package(s)", packages_to_upgrade.len()));
     

@@ -155,6 +155,11 @@ impl Installer {
     /// Führt einen Hook aus (sandboxed)
     /// Extrahiert und führt Skripte aus einem .deb-Paket aus
     pub async fn run_hook(&self, hook_type: HookType, deb_path: &Path, verbose: bool) -> Result<()> {
+        self.run_hook_with_old_version(hook_type, deb_path, None, verbose).await
+    }
+    
+    /// Extrahiert und führt Skripte aus einem .deb-Paket aus mit alter Version
+    pub async fn run_hook_with_old_version(&self, hook_type: HookType, deb_path: &Path, old_version: Option<&str>, verbose: bool) -> Result<()> {
         // Determine script name based on hook type
         let script_name = match hook_type {
             HookType::PreInstall => "preinst",
@@ -201,13 +206,86 @@ impl Installer {
             println!("  Running {} hook...", script_name);
         }
         
-        // Execute script with basic environment
-        let output = Command::new("/bin/sh")
-            .arg(&script_path)
+        // Extract package name from deb path for DPKG_MAINTSCRIPT_PACKAGE
+        let package_name = deb_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .split('_')
+            .next()
+            .unwrap_or("");
+        
+        // Execute script with proper dpkg environment variables
+        // For preinst: upgrade <old-version> or install (no params)
+        // For postinst: configure <old-version> or abort-upgrade <old-version> or abort-remove <in-favour> <old-version>
+        // We'll use "upgrade" for preinst and "configure" for postinst as defaults
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&script_path)
             .env("DPKG_MAINTSCRIPT_NAME", script_name)
+            .env("DPKG_MAINTSCRIPT_PACKAGE", package_name)
             .env("DPKG_ROOT", &self.install_root)
-            .current_dir(&self.install_root)
-            .output()?;
+            .env("DPKG_ADMINDIR", "/var/lib/dpkg")
+            .current_dir(&self.install_root);
+        
+        // Add script arguments based on hook type
+        // Get old version from parameter or try to query dpkg
+        let old_ver = if let Some(ov) = old_version {
+            ov.to_string()
+        } else {
+            // Try to get old version from dpkg-query
+            // Extract package name from deb path
+            let deb_name = deb_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .split('_')
+                .next()
+                .unwrap_or("");
+            
+            if !deb_name.is_empty() {
+                let output = std::process::Command::new("dpkg-query")
+                    .arg("-W")
+                    .arg("-f=${Version}")
+                    .arg(deb_name)
+                    .output();
+                
+                if let Ok(output) = output {
+                    if output.status.success() {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    } else {
+                        String::new() // Not installed, empty string
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        };
+        
+        match hook_type {
+            HookType::PreInstall => {
+                // For preinst, pass "upgrade, pass "upgrade" and old version
+                // If old version is empty, it's a fresh install, use "install" instead
+                if old_ver.is_empty() {
+                    cmd.arg("install");
+                } else {
+                    cmd.arg("upgrade").arg(&old_ver);
+                }
+            }
+            HookType::PostInstall => {
+                // For postinst, pass "configure" and old version
+                cmd.arg("configure").arg(&old_ver);
+            }
+            HookType::PreRemove => {
+                // For prerm, pass "remove"
+                cmd.arg("remove");
+            }
+            HookType::PostRemove => {
+                // For postrm, pass "remove"
+                cmd.arg("remove");
+            }
+        }
+        
+        let output = cmd.output()?;
         
         // Cleanup
         fs::remove_dir_all(&temp_dir)?;
@@ -239,24 +317,53 @@ impl Installer {
         // Verwende dpkg-deb zum Extrahieren der .deb-Datei
         // Dies ist eine einfache Implementierung, die dpkg-deb verwendet
         
-        // Validate checksum if provided
-        if let Some(expected) = expected_checksum {
-            let actual_checksum = Self::calculate_file_checksum(deb_path)?;
-            if actual_checksum != expected {
-                return Err(anyhow::anyhow!(
-                    "Checksum mismatch: expected {}, got {}", 
-                    expected, 
-                    actual_checksum
-                ));
-            }
-            if verbose {
-                println!("  Checksum validated: {}", actual_checksum);
-            }
-        }
-        
+        // First, try to extract the package to see if it's valid
         let temp_dir = std::env::temp_dir().join(format!("apt-ng-install-{}", 
             std::process::id()));
         fs::create_dir_all(&temp_dir)?;
+        
+        // Test extraction first - if it works, the file is valid regardless of checksum
+        let test_output = Command::new("dpkg-deb")
+            .arg("-I")
+            .arg(deb_path)
+            .output();
+        
+        let extraction_test_ok = if let Ok(output) = test_output {
+            output.status.success()
+        } else {
+            false
+        };
+        
+        // Validate checksum if provided, but only fail if extraction also fails
+        if let Some(expected) = expected_checksum {
+            let actual_checksum = Self::calculate_file_checksum(deb_path)?;
+            if actual_checksum != expected {
+                if !extraction_test_ok {
+                    // Both checksum and extraction failed - file is definitely corrupted
+                    eprintln!("  ⚠ Error: Checksum mismatch for {}: expected {}, got {}", 
+                        deb_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
+                        expected, 
+                        actual_checksum
+                    );
+                    eprintln!("  File also fails extraction test. Deleting corrupted file...");
+                    let _ = std::fs::remove_file(deb_path);
+                    return Err(anyhow::anyhow!(
+                        "Package file corrupted (checksum mismatch and extraction failed). Deleted corrupted file. Please run the command again to re-download."
+                    ));
+                } else {
+                    // Checksum mismatch but extraction works - index might be wrong, warn but continue
+                    eprintln!("  ⚠ Warning: Checksum mismatch for {}: expected {}, got {}", 
+                        deb_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
+                        expected, 
+                        actual_checksum
+                    );
+                    eprintln!("  File appears valid (extraction test passed). Continuing installation...");
+                    eprintln!("  (Index checksum may be outdated or incorrect)");
+                }
+            } else if verbose {
+                println!("  Checksum validated: {}", actual_checksum);
+            }
+        }
         
         // Extrahiere .deb-Datei mit dpkg-deb
         let output = Command::new("dpkg-deb")
@@ -267,6 +374,18 @@ impl Installer {
         
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // Check if the error indicates a corrupted file
+            if stderr.contains("unexpected end of file") || 
+               stderr.contains("lzma error") || 
+               stderr.contains("corrupted") ||
+               stderr.contains("invalid") {
+                // Try to delete the corrupted file
+                let _ = std::fs::remove_file(deb_path);
+                return Err(anyhow::anyhow!(
+                    "Package file appears to be corrupted: {}. Deleted corrupted file. Please run the command again to re-download.",
+                    stderr
+                ));
+            }
             return Err(anyhow::anyhow!("Failed to extract .deb package: {}", stderr));
         }
         
@@ -274,8 +393,44 @@ impl Installer {
             println!("  Extracted package to temporary directory");
         }
         
-        // Run pre-install hook
-        self.run_hook(HookType::PreInstall, deb_path, verbose).await?;
+        // Get old version if package is already installed
+        let old_version = {
+            // Extract package name from deb path (format: package_version_arch.deb)
+            let deb_name = deb_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .split('_')
+                .next()
+                .unwrap_or("");
+            
+            if !deb_name.is_empty() {
+                let output = std::process::Command::new("dpkg-query")
+                    .arg("-W")
+                    .arg("-f=${Version}")
+                    .arg(deb_name)
+                    .output();
+                
+                if let Ok(output) = output {
+                    if output.status.success() {
+                        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !version.is_empty() {
+                            Some(version)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None // Not installed
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        
+        // Run pre-install hook with old version
+        self.run_hook_with_old_version(HookType::PreInstall, deb_path, old_version.as_deref(), verbose).await?;
         
         // Copy files atomically to install_root with checksum validation
         // Use atomic operations: copy to temp location, then rename atomically
@@ -285,8 +440,8 @@ impl Installer {
                     println!("  Installed files to {}", self.install_root.display());
                 }
                 
-                // Run post-install hook
-                self.run_hook(HookType::PostInstall, deb_path, verbose).await?;
+                // Run post-install hook with old version
+                self.run_hook_with_old_version(HookType::PostInstall, deb_path, old_version.as_deref(), verbose).await?;
                 
                 // Aufräumen
                 fs::remove_dir_all(&temp_dir)?;

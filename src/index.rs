@@ -180,7 +180,7 @@ impl Index {
         Ok(())
     }
     
-    /// Sucht nach Paketen im Index
+    /// Sucht nach Paketen im Index (fuzzy search - findet auch Teilstrings)
     pub fn search(&self, query: &str) -> Result<Vec<PackageManifest>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, version, arch, provides, depends, size, checksum, timestamp, repo_id, filename
@@ -194,6 +194,43 @@ impl Index {
         
         let rows = stmt.query_map(
             rusqlite::params![pattern, prefix_pattern],
+            |row| {
+                Ok(PackageManifest {
+                    name: row.get(0)?,
+                    version: row.get(1)?,
+                    arch: row.get(2)?,
+                    provides: serde_json::from_str(row.get::<_, String>(3)?.as_str()).unwrap_or_default(),
+                    depends: serde_json::from_str(row.get::<_, String>(4)?.as_str()).unwrap_or_default(),
+                    conflicts: vec![],
+                    replaces: vec![],
+                    files: vec![],
+                    size: row.get(5)?,
+                    checksum: row.get(6)?,
+                    timestamp: row.get(7)?,
+                    repo_id: row.get::<_, Option<i64>>(8)?,
+                    filename: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+                })
+            }
+        )?;
+        
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+    
+    /// Sucht nach Paketen mit exaktem Namen (für Upgrades)
+    pub fn search_exact(&self, package_name: &str) -> Result<Vec<PackageManifest>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, version, arch, provides, depends, size, checksum, timestamp, repo_id, filename
+             FROM packages
+             WHERE name = ?1
+             ORDER BY version DESC"
+        )?;
+        
+        let rows = stmt.query_map(
+            [package_name],
             |row| {
                 Ok(PackageManifest {
                     name: row.get(0)?,

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use crate::package::PackageManifest;
 use crate::apt_parser::parse_dependency_rule;
 
@@ -43,6 +44,8 @@ pub struct Solution {
 #[allow(dead_code)]
 pub struct DependencySolver {
     packages: HashMap<String, Vec<PackageInfo>>,
+    installed_packages: HashSet<String>,
+    installed_provides: HashMap<String, Vec<String>>, // Maps dependency name to list of installed packages that provide it
 }
 
 impl DependencySolver {
@@ -50,6 +53,36 @@ impl DependencySolver {
     pub fn new() -> Self {
         DependencySolver {
             packages: HashMap::new(),
+            installed_packages: HashSet::new(),
+            installed_provides: HashMap::new(),
+        }
+    }
+    
+    /// Set the list of already-installed packages
+    /// Dependencies satisfied by these packages will be skipped during resolution
+    #[allow(dead_code)]
+    pub fn set_installed_packages(&mut self, installed: HashSet<String>) {
+        self.installed_packages = installed;
+        // Rebuild installed_provides map
+        self.installed_provides.clear();
+        for (pkg_name, pkgs) in &self.packages {
+            if self.installed_packages.contains(pkg_name) {
+                for pkg in pkgs {
+                    // Every package provides its own name
+                    self.installed_provides
+                        .entry(pkg.name.clone())
+                        .or_insert_with(Vec::new)
+                        .push(pkg.name.clone());
+                    
+                    // Add explicit provides
+                    for provided in &pkg.provides {
+                        self.installed_provides
+                            .entry(provided.clone())
+                            .or_insert_with(Vec::new)
+                            .push(pkg.name.clone());
+                    }
+                }
+            }
         }
     }
     
@@ -88,10 +121,29 @@ impl DependencySolver {
     /// Fügt ein Paket zum Solver hinzu
     #[allow(dead_code)]
     pub fn add_package(&mut self, pkg: PackageInfo) {
+        let is_installed = self.installed_packages.contains(&pkg.name);
+        
         self.packages
             .entry(pkg.name.clone())
             .or_insert_with(Vec::new)
-            .push(pkg);
+            .push(pkg.clone());
+        
+        // Update installed_provides if this is an installed package
+        if is_installed {
+            // Every package provides its own name
+            self.installed_provides
+                .entry(pkg.name.clone())
+                .or_insert_with(Vec::new)
+                .push(pkg.name.clone());
+            
+            // Add explicit provides
+            for provided in &pkg.provides {
+                self.installed_provides
+                    .entry(provided.clone())
+                    .or_insert_with(Vec::new)
+                    .push(pkg.name.clone());
+            }
+        }
     }
     
     /// Löst Abhängigkeiten für die angeforderten Pakete
@@ -106,8 +158,16 @@ impl DependencySolver {
                 // Wähle die passende Version
                 let pkg = self.select_best_version(packages, spec)?;
                 
+                // Always resolve dependencies for requested packages, even if already installed
+                // This ensures upgrades are handled correctly
                 if !visited.contains(&pkg.name) {
                     self.resolve_dependencies(&pkg, &mut to_install, &mut visited, &mut conflicts)?;
+                } else {
+                    // Package was already visited (as a dependency), but we still need to add it
+                    // if it was explicitly requested and not already in to_install
+                    if !to_install.iter().any(|p| p.name == pkg.name) {
+                        to_install.push(pkg.clone());
+                    }
                 }
             } else {
                 return Err(anyhow::anyhow!("Package not found: {}", spec.name));
@@ -264,6 +324,166 @@ impl DependencySolver {
         }
     }
     
+    /// Check if a package is installed on the system (via dpkg)
+    fn is_package_installed_on_system(package_name: &str) -> bool {
+        // Check if package is installed using dpkg-query
+        let output = Command::new("dpkg-query")
+            .arg("-W")
+            .arg("-f=${Status}")
+            .arg(package_name)
+            .output();
+        
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Status should contain "installed" for installed packages
+                return stdout.contains("installed");
+            }
+        }
+        
+        // Fallback: try dpkg -l
+        let output = Command::new("dpkg")
+            .arg("-l")
+            .arg(package_name)
+            .output();
+        
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // dpkg -l output format: "ii  package-name  version  description"
+            // "ii" means installed and configured
+            stdout.lines().any(|line| {
+                line.starts_with("ii") && line.split_whitespace().nth(1) == Some(package_name)
+            })
+        } else {
+            false
+        }
+    }
+    
+    /// Check if any system package provides a dependency (via apt-cache)
+    fn is_dependency_provided_by_system(dep_name: &str) -> bool {
+        // First, try dpkg-query to check if any installed package provides this
+        // This is faster and more reliable than apt-cache
+        let output = Command::new("dpkg-query")
+            .arg("-W")
+            .arg("-f=${Package} ${Provides}\n")
+            .output();
+        
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let package_name = parts[0];
+                        // Check if this package provides the dependency
+                        for part in parts.iter().skip(1) {
+                            // Provides format: "libqt5core5t64 (= 5.15.13+dfsg-1)" or just "libqt5core5t64"
+                            let provided = part.split('(').next().unwrap_or(part).trim();
+                            if provided == dep_name {
+                                if Self::is_package_installed_on_system(package_name) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: Use apt-cache to find packages that provide this dependency
+        let output = Command::new("apt-cache")
+            .arg("showpkg")
+            .arg(dep_name)
+            .output();
+        
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // apt-cache showpkg shows providers in the output
+                // Look for "Reverse Provides:" section
+                let mut in_reverse_provides = false;
+                for line in stdout.lines() {
+                    if line.starts_with("Reverse Provides:") {
+                        in_reverse_provides = true;
+                        continue;
+                    }
+                    if in_reverse_provides {
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        // Check if any provider is installed
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if !parts.is_empty() {
+                            let provider_name = parts[0];
+                            if Self::is_package_installed_on_system(provider_name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Check if a dependency is satisfied by an already-installed package
+    fn is_dependency_satisfied_by_installed(&self, dep: &DependencyRule) -> bool {
+        // Check if dependency name matches an installed package name directly
+        if self.installed_packages.contains(&dep.name) {
+            // If version constraint specified, we need to check versions
+            if let Some(ref constraint) = dep.version_constraint {
+                if let Some(pkgs) = self.packages.get(&dep.name) {
+                    for pkg in pkgs {
+                        if Self::version_matches(&pkg.version, constraint) {
+                            return true;
+                        }
+                    }
+                    return false; // Version constraint not satisfied
+                }
+            }
+            return true; // No version constraint, installed package satisfies
+        }
+        
+        // Check if any installed package provides this dependency
+        if let Some(providers) = self.installed_provides.get(&dep.name) {
+            if !providers.is_empty() {
+                // If version constraint specified, we need to check versions
+                if let Some(ref constraint) = dep.version_constraint {
+                    // Find the providing package and check its version
+                    for provider_name in providers {
+                        if let Some(pkgs) = self.packages.get(provider_name) {
+                            for pkg in pkgs {
+                                if Self::version_matches(&pkg.version, constraint) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // No version constraint, any provider is fine
+                    return true;
+                }
+            }
+        }
+        
+        // Check if dependency is satisfied by a system package (not managed by apt-ng)
+        // This handles cases where packages are installed via apt/dpkg but not tracked by apt-ng
+        if Self::is_package_installed_on_system(&dep.name) {
+            // If version constraint specified, we can't easily check it without querying dpkg
+            // For now, assume it's satisfied if the package is installed
+            // TODO: Could enhance this to check version constraints using dpkg -l output
+            return true;
+        }
+        
+        // Check if any system package provides this dependency
+        if Self::is_dependency_provided_by_system(&dep.name) {
+            return true;
+        }
+        
+        false
+    }
+    
     #[allow(dead_code)]
     fn resolve_dependencies(
         &self,
@@ -287,6 +507,11 @@ impl DependencySolver {
         
         // Löse Abhängigkeiten
         for dep in &pkg.depends {
+            // Check if dependency is already satisfied by an installed package
+            if self.is_dependency_satisfied_by_installed(dep) {
+                continue; // Skip this dependency, it's already satisfied
+            }
+            
             // Try to find package by name
             if let Some(packages) = self.packages.get(&dep.name) {
                 let dep_pkg = self.select_best_version(packages, &PackageSpec {
@@ -298,10 +523,15 @@ impl DependencySolver {
                 self.resolve_dependencies(dep_pkg, to_install, visited, conflicts)?;
             } else {
                 // Check if any package provides this dependency
+                // In Debian, every package implicitly provides its own name
                 let mut found = false;
                 for (_, pkgs) in &self.packages {
                     for pkg_candidate in pkgs {
-                        if pkg_candidate.provides.contains(&dep.name) {
+                        // Check if package name matches dependency (implicit provide)
+                        let provides_dep = pkg_candidate.name == dep.name || 
+                                          pkg_candidate.provides.contains(&dep.name);
+                        
+                        if provides_dep {
                             // Check version constraint if specified
                             if let Some(ref constraint) = dep.version_constraint {
                                 if !Self::version_matches(&pkg_candidate.version, constraint) {
@@ -319,12 +549,107 @@ impl DependencySolver {
                 }
                 
                 if !found {
-                    return Err(anyhow::anyhow!("Dependency not found: {}", dep.name));
+                    // Last resort: check if dependency is satisfied by a system package
+                    // This handles cases where packages are installed via apt/dpkg but not tracked by apt-ng
+                    if Self::is_package_installed_on_system(&dep.name) || 
+                       Self::is_dependency_provided_by_system(&dep.name) {
+                        // Dependency is satisfied by system package, skip it
+                        continue;
+                    }
+                    
+                    // Try to find similar package names that might satisfy this dependency
+                    // This handles transitional packages (e.g., libqt5core5t64 -> libqt5core5a)
+                    // Simple approach: find packages that start with a common prefix
+                    // For "libqt5core5t64", look for packages starting with "libqt5core5"
+                    let mut similar_packages = Vec::new();
+                    
+                    // Try different base name extraction strategies
+                    let mut bases = Vec::new();
+                    
+                    // Strategy 1: Remove trailing alphanumeric: "libqt5core5t64" -> "libqt5core5"
+                    bases.push(dep.name.trim_end_matches(|c: char| c.is_ascii_alphanumeric() && c != '5'));
+                    
+                    // Strategy 2: Remove trailing digits and letters: "libqt5core5t64" -> "libqt5core5"
+                    bases.push(dep.name.trim_end_matches(|c: char| c.is_ascii_alphabetic()));
+                    
+                    // Strategy 3: Use first part before last digit sequence
+                    let mut base_str = dep.name.clone();
+                    while base_str.len() > 5 && base_str.chars().last().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+                        base_str.pop();
+                    }
+                    bases.push(&base_str);
+                    
+                    for dep_base in bases {
+                        if dep_base.len() < 5 {
+                            continue; // Skip too short bases
+                        }
+                        
+                        // Look for packages that start with the base name
+                        for (pkg_name, pkgs) in &self.packages {
+                            if pkg_name.starts_with(dep_base) && *pkg_name != dep.name {
+                                for pkg in pkgs {
+                                    similar_packages.push((pkg_name.clone(), pkg.clone()));
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if !similar_packages.is_empty() {
+                            break; // Found similar packages, stop searching
+                        }
+                    }
+                    
+                    // If we found similar packages, try to use the first one
+                    if !similar_packages.is_empty() {
+                        let (_similar_name, similar_pkg) = &similar_packages[0];
+                        // Check version constraint if specified
+                        let mut version_ok = true;
+                        if let Some(ref constraint) = dep.version_constraint {
+                            version_ok = Self::version_matches(&similar_pkg.version, constraint);
+                        }
+                        
+                        if version_ok {
+                            // Use the similar package as a substitute
+                            self.resolve_dependencies(similar_pkg, to_install, visited, conflicts)?;
+                            continue;
+                        }
+                    }
+                    
+                    // Try to find packages that provide this dependency for better error message
+                    let mut providers = Vec::new();
+                    let mut installed_providers = Vec::new();
+                    
+                    for (pkg_name, pkgs) in &self.packages {
+                        for pkg in pkgs {
+                            if pkg.provides.contains(&dep.name) || pkg.name == dep.name {
+                                if self.installed_packages.contains(pkg_name) {
+                                    installed_providers.push(format!("{} (installed)", pkg_name));
+                                } else {
+                                    providers.push(pkg_name.clone());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    
+                    let mut error_msg = format!("Dependency not found: {}", dep.name);
+                    if !installed_providers.is_empty() {
+                        error_msg.push_str(&format!(" (installed providers: {})", installed_providers.join(", ")));
+                    }
+                    if !providers.is_empty() {
+                        error_msg.push_str(&format!(" (available providers: {})", providers.join(", ")));
+                    }
+                    if !similar_packages.is_empty() {
+                        error_msg.push_str(&format!(" (similar packages found: {})", similar_packages.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", ")));
+                    }
+                    
+                    return Err(anyhow::anyhow!(error_msg));
                 }
             }
         }
         
         // Füge Paket hinzu, wenn noch nicht vorhanden
+        // Always add requested packages, even if already installed (needed for upgrades)
         if !to_install.iter().any(|p| p.name == pkg.name) {
             to_install.push(pkg.clone());
         }
