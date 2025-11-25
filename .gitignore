@@ -61,3 +61,6 @@ completions/apt-ng.zsh
 tarpaulin-report.html
 coverage/
 
+# Local versioning documentation (not for repository)
+VERSIONING.md
+
