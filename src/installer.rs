@@ -476,14 +476,55 @@ impl Installer {
                 // Recursively copy directories
                 Self::copy_directory_atomic(&source_path, &dest_path, transaction, verbose)?;
             } else if source_path.is_file() {
+                // Check if destination exists and is a directory (conflict)
+                // Also check if it's a symlink to a directory
+                if dest_path.exists() {
+                    let is_dir = if dest_path.is_symlink() {
+                        // Follow symlink to check if it points to a directory
+                        match fs::metadata(&dest_path) {
+                            Ok(meta) => meta.is_dir(),
+                            Err(_) => false,
+                        }
+                    } else {
+                        dest_path.is_dir()
+                    };
+                    
+                    if is_dir {
+                        return Err(anyhow::anyhow!(
+                            "Cannot install file {}: destination {} is a directory",
+                            source_path.display(),
+                            dest_path.display()
+                        ));
+                    }
+                }
+                
                 // Copy file atomically
                 // 1. Copy to temp file with .tmp suffix
-                let temp_dest = dest_path.with_extension(format!("{}.tmp", 
-                    dest_path.extension().and_then(|s| s.to_str()).unwrap_or("tmp")));
+                // Use a more robust method for creating temp filename
+                let temp_dest = if let Some(file_name) = dest_path.file_name() {
+                    let file_name_str = file_name.to_string_lossy();
+                    let parent = dest_path.parent().unwrap_or_else(|| Path::new("/"));
+                    parent.join(format!("{}.apt-ng-tmp", file_name_str))
+                } else {
+                    // Fallback: append .apt-ng-tmp to the path
+                    PathBuf::from(format!("{}.apt-ng-tmp", dest_path.display()))
+                };
+                
+                // Ensure parent directory exists
+                if let Some(parent) = temp_dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 
                 // Copy file contents
                 let mut source_file = fs::File::open(&source_path)?;
-                let mut dest_file = fs::File::create(&temp_dest)?;
+                let mut dest_file = fs::File::create(&temp_dest).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to create temporary file {}: {} (source: {})",
+                        temp_dest.display(),
+                        e,
+                        source_path.display()
+                    )
+                })?;
                 
                 // Preserve permissions
                 let metadata = source_path.metadata()?;
@@ -494,15 +535,24 @@ impl Installer {
                 io::copy(&mut source_file, &mut dest_file)?;
                 dest_file.sync_all()?; // Ensure data is written to disk
                 
-                // 2. Backup existing file if it exists
-                if dest_path.exists() {
+                // 2. Backup existing file if it exists (only if it's a file, not a directory)
+                if dest_path.exists() && dest_path.is_file() {
                     let backup_path = dest_path.with_extension(format!("{}.bak", 
                         dest_path.extension().and_then(|s| s.to_str()).unwrap_or("bak")));
                     fs::copy(&dest_path, &backup_path)?;
                     transaction.add_backup(dest_path.clone(), backup_path);
                 }
                 
-                // 3. Atomically rename temp file to final destination
+                // 3. Remove existing destination if it exists (could be a symlink or file)
+                if dest_path.exists() {
+                    if dest_path.is_symlink() {
+                        fs::remove_file(&dest_path)?;
+                    } else if dest_path.is_file() {
+                        fs::remove_file(&dest_path)?;
+                    }
+                }
+                
+                // 4. Atomically rename temp file to final destination
                 fs::rename(&temp_dest, &dest_path)?;
                 transaction.add_installed_file(dest_path.clone());
                 
