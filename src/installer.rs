@@ -141,14 +141,13 @@ impl Installer {
     
     /// Installiert mehrere Pakete parallel
     #[allow(dead_code)]
-    pub async fn install_packages(&self, apx_paths: &[PathBuf]) -> Result<Vec<Result<()>>> {
+    pub async fn install_packages(&self, apx_paths: &[PathBuf], verifier: Option<&crate::verifier::PackageVerifier>, verbose: bool) -> Result<Vec<Result<InstallationTransaction>>> {
         use futures::stream::{self, StreamExt};
         
+        let self_ref = self;
         let results: Vec<_> = stream::iter(apx_paths.iter().cloned())
-            .map(|_path| async move {
-                // Note: In a real implementation, we'd need to pass self differently
-                // For now, this is a placeholder that shows the structure
-                Ok::<(), anyhow::Error>(())
+            .map(|path| async move {
+                self_ref.install_package(&path, verifier, verbose).await
             })
             .buffer_unordered(self.worker_pool_size)
             .collect()
@@ -159,13 +158,130 @@ impl Installer {
     
     /// Entfernt ein installiertes Paket
     #[allow(dead_code)]
-    pub async fn remove_package(&self, _package_name: &str) -> Result<()> {
-        // TODO: Implementierung:
+    pub async fn remove_package(&self, package_name: &str, index: &crate::index::Index, verbose: bool) -> Result<()> {
         // 1. Lade Manifest des installierten Pakets
-        // 2. Führe pre-remove Hook aus
-        // 3. Entferne Dateien (mit Abhängigkeitsprüfung)
+        let installed_packages = index.list_installed_packages_with_manifests()?;
+        let package_manifest = installed_packages.iter()
+            .find(|p| p.name == package_name)
+            .ok_or_else(|| anyhow::anyhow!("Package {} is not installed", package_name))?;
+        
+        if verbose {
+            println!("Removing package: {} ({})", package_name, package_manifest.version);
+        }
+        
+        // Check for dependencies - warn if other packages depend on this one
+        // This is a basic check, a full implementation would use the solver
+        let all_packages = index.list_installed_packages_with_manifests()?;
+        let mut dependent_packages = Vec::new();
+        for pkg in &all_packages {
+            if pkg.name != package_name {
+                for dep in &pkg.depends {
+                    if dep == package_name {
+                        dependent_packages.push(pkg.name.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if !dependent_packages.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cannot remove {}: the following packages depend on it: {}",
+                package_name,
+                dependent_packages.join(", ")
+            ));
+        }
+        
+        // 2. Führe pre-remove Hook aus (if .deb file exists in cache)
+        // Try to find the .deb file in cache or use dpkg to get hook info
+        let deb_path_opt = if let Some(ref _filename) = package_manifest.filename {
+            // Try to construct path from filename
+            // This is a simplified approach - in production would use proper cache lookup
+            let cache_path = self.install_root.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("cache").join("packages"))
+                .and_then(|cache_dir| {
+                    // Extract package name and version from filename
+                    let deb_name = format!("{}_{}_{}.deb", 
+                        package_manifest.name, 
+                        package_manifest.version,
+                        package_manifest.arch);
+                    Some(cache_dir.join(deb_name))
+                });
+            cache_path.filter(|p| p.exists())
+        } else {
+            None
+        };
+        
+        if let Some(ref deb_path) = deb_path_opt {
+            if verbose {
+                println!("  Running pre-remove hook...");
+            }
+            self.run_hook_with_old_version(HookType::PreRemove, deb_path, Some(&package_manifest.version), verbose).await?;
+        }
+        
+        // 3. Entferne Dateien
+        if verbose {
+            println!("  Removing files...");
+        }
+        
+        // Remove files listed in manifest
+        for file_entry in &package_manifest.files {
+            let file_path = self.install_root.join(&file_entry.path);
+            if file_path.exists() {
+                if file_path.is_dir() {
+                    if verbose {
+                        println!("    Removing directory: {}", file_entry.path);
+                    }
+                    fs::remove_dir_all(&file_path)?;
+                } else {
+                    if verbose {
+                        println!("    Removing file: {}", file_entry.path);
+                    }
+                    fs::remove_file(&file_path)?;
+                }
+            }
+        }
+        
+        // Also try to remove using dpkg-deb if available (for .deb packages)
+        if deb_path_opt.is_none() {
+            // Try using dpkg to get file list
+            let output = Command::new("dpkg-query")
+                .arg("-L")
+                .arg(package_name)
+                .output();
+            
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let file_list = String::from_utf8_lossy(&output.stdout);
+                    for line in file_list.lines() {
+                        let file_path = Path::new(line.trim());
+                        if file_path.exists() && file_path.starts_with(&self.install_root) {
+                            if file_path.is_dir() {
+                                let _ = fs::remove_dir_all(file_path);
+                            } else {
+                                let _ = fs::remove_file(file_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         // 4. Führe post-remove Hook aus
+        if let Some(ref deb_path) = deb_path_opt {
+            if verbose {
+                println!("  Running post-remove hook...");
+            }
+            self.run_hook_with_old_version(HookType::PostRemove, deb_path, Some(&package_manifest.version), verbose).await?;
+        }
+        
         // 5. Aktualisiere installierte Pakete-Datenbank
+        index.mark_removed(package_name)?;
+        
+        if verbose {
+            println!("  Package {} removed successfully", package_name);
+        }
         
         Ok(())
     }

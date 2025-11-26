@@ -208,6 +208,31 @@ pub enum RepoCommands {
     ///   $ apt-ng repo update
     ///   $ apt-ng repo update -v  # Verbose output
     Update,
+    
+    /// Generate repository index files
+    ///
+    /// Scans a directory for packages and generates Packages and Release files.
+    ///
+    /// Examples:
+    ///   $ apt-ng repo generate /path/to/packages
+    ///   $ apt-ng repo generate /path/to/packages --suite stable --component main
+    Generate {
+        /// Directory containing package files
+        #[arg(value_name = "DIRECTORY")]
+        directory: String,
+        /// Suite name (e.g., stable, testing)
+        #[arg(long, default_value = "stable")]
+        suite: String,
+        /// Component name (e.g., main, contrib)
+        #[arg(long, default_value = "main")]
+        component: String,
+        /// Architecture (e.g., amd64, arm64)
+        #[arg(long, default_value = "amd64")]
+        arch: String,
+        /// Signing key file (optional)
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

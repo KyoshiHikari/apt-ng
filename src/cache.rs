@@ -2,8 +2,10 @@ use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use hex;
+use std::os::unix::fs::MetadataExt;
 
 pub struct Cache {
     pub cache_dir: PathBuf,
@@ -43,9 +45,112 @@ impl Cache {
         fs::create_dir_all(&package_dir)?;
         
         let path = self.package_path(name, version, arch);
-        fs::write(&path, data)?;
+        
+        // Berechne Checksumme für Deduplikation
+        let checksum = Self::calculate_checksum(data);
+        
+        // Prüfe, ob bereits ein Paket mit derselben Checksumme existiert
+        if let Some(existing_path) = self.find_package_by_checksum(&checksum)? {
+            // Erstelle Hardlink statt Datei zu kopieren
+            if let Err(_e) = fs::hard_link(&existing_path, &path) {
+                // Falls Hardlink fehlschlägt (z.B. auf verschiedenen Dateisystemen), kopiere die Datei
+                fs::copy(&existing_path, &path)?;
+            }
+        } else {
+            // Neue Datei schreiben
+            fs::write(&path, data)?;
+            
+            // Speichere Checksumme in Index
+            self.update_checksum_index(&checksum, &path)?;
+        }
         
         Ok(path)
+    }
+    
+    /// Fügt ein Paket aus einer Datei zum Cache hinzu (mit Deduplikation)
+    pub fn add_package_from_file(&self, name: &str, version: &str, arch: &str, ext: &str, source_file: &Path) -> Result<PathBuf> {
+        let package_dir = self.cache_dir.join("packages");
+        fs::create_dir_all(&package_dir)?;
+        
+        let path = self.package_path_with_ext(name, version, arch, ext);
+        
+        // Berechne Checksumme der Quelldatei
+        let data = fs::read(source_file)?;
+        let checksum = Self::calculate_checksum(&data);
+        
+        // Prüfe, ob bereits ein Paket mit derselber Checksumme existiert
+        if let Some(existing_path) = self.find_package_by_checksum(&checksum)? {
+            // Erstelle Hardlink statt Datei zu kopieren
+            if let Err(_e) = fs::hard_link(&existing_path, &path) {
+                // Falls Hardlink fehlschlägt, kopiere die Datei
+                fs::copy(&existing_path, &path)?;
+            }
+        } else {
+            // Kopiere Datei in Cache
+            fs::copy(source_file, &path)?;
+            
+            // Speichere Checksumme in Index
+            self.update_checksum_index(&checksum, &path)?;
+        }
+        
+        Ok(path)
+    }
+    
+    /// Findet ein Paket anhand seiner Checksumme
+    fn find_package_by_checksum(&self, checksum: &str) -> Result<Option<PathBuf>> {
+        let checksum_index = self.load_checksum_index()?;
+        Ok(checksum_index.get(checksum).cloned())
+    }
+    
+    /// Lädt den Checksum-Index
+    fn load_checksum_index(&self) -> Result<HashMap<String, PathBuf>> {
+        let index_path = self.cache_dir.join("checksums.json");
+        
+        if !index_path.exists() {
+            return Ok(HashMap::new());
+        }
+        
+        let content = fs::read_to_string(&index_path)?;
+        let index: HashMap<String, String> = serde_json::from_str(&content)
+            .unwrap_or_default();
+        
+        // Konvertiere String-Pfade zu PathBuf
+        let mut result = HashMap::new();
+        for (checksum, path_str) in index {
+            let path = PathBuf::from(path_str);
+            // Prüfe, ob die Datei noch existiert
+            if path.exists() {
+                result.insert(checksum, path);
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// Aktualisiert den Checksum-Index
+    fn update_checksum_index(&self, checksum: &str, path: &Path) -> Result<()> {
+        let mut index = self.load_checksum_index()?;
+        
+        // Füge neuen Eintrag hinzu, falls noch nicht vorhanden
+        if !index.contains_key(checksum) {
+            index.insert(checksum.to_string(), path.to_path_buf());
+            
+            // Speichere Index
+            let index_path = self.cache_dir.join("checksums.json");
+            let index_str: HashMap<String, String> = index.iter()
+                .map(|(k, v)| (k.clone(), v.to_string_lossy().to_string()))
+                .collect();
+            let content = serde_json::to_string_pretty(&index_str)?;
+            fs::write(&index_path, content)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Prüft, ob eine Datei ein Hardlink ist und ob andere Hardlinks existieren
+    fn count_hardlinks(&self, path: &Path) -> Result<u64> {
+        let metadata = fs::metadata(path)?;
+        Ok(metadata.nlink())
     }
     
     /// Berechnet die Checksumme einer Datei
@@ -64,10 +169,44 @@ impl Cache {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_file() {
-                    fs::remove_file(&path)?;
+                    // Prüfe Hardlinks: Wenn nlink > 1, ist es ein Hardlink
+                    // Entferne nur, wenn es der letzte Link ist
+                    let nlink = self.count_hardlinks(&path).unwrap_or(1);
+                    if nlink == 1 {
+                        fs::remove_file(&path)?;
+                    }
                 }
             }
         }
+        
+        // Bereinige Checksum-Index
+        self.clean_checksum_index()?;
+        
+        Ok(())
+    }
+    
+    /// Bereinigt den Checksum-Index von nicht mehr existierenden Dateien
+    fn clean_checksum_index(&self) -> Result<()> {
+        let mut index = self.load_checksum_index()?;
+        let mut updated = false;
+        
+        index.retain(|_checksum, path| {
+            let exists = path.exists();
+            if !exists {
+                updated = true;
+            }
+            exists
+        });
+        
+        if updated {
+            let index_path = self.cache_dir.join("checksums.json");
+            let index_str: HashMap<String, String> = index.iter()
+                .map(|(k, v)| (k.clone(), v.to_string_lossy().to_string()))
+                .collect();
+            let content = serde_json::to_string_pretty(&index_str)?;
+            fs::write(&index_path, content)?;
+        }
+        
         Ok(())
     }
     

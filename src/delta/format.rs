@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Metadata for a delta package
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DeltaMetadata {
     pub from_version: String,
     pub to_version: String,
@@ -14,6 +15,7 @@ pub struct DeltaMetadata {
 
 impl DeltaMetadata {
     /// Calculate size savings percentage
+    #[allow(dead_code)]
     pub fn savings_percentage(&self) -> f64 {
         if self.full_size == 0 {
             return 0.0;
@@ -22,6 +24,7 @@ impl DeltaMetadata {
     }
     
     /// Check if delta is worth using (e.g., saves at least 10%)
+    #[allow(dead_code)]
     pub fn is_worthwhile(&self) -> bool {
         self.savings_percentage() >= 10.0
     }

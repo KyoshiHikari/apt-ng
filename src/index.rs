@@ -341,6 +341,67 @@ impl Index {
         }
     }
     
+    /// Wählt die beste Mirror-URL basierend auf Performance-Metriken
+    /// Gibt die beste URL zurück, oder die ursprüngliche URL falls keine Metriken verfügbar sind
+    pub fn select_best_mirror_url(&self, base_url: &str) -> Result<String> {
+        use crate::repo::Repository;
+        
+        // Extrahiere Base-URL (ohne Pfad)
+        let base = if let Some(slash_pos) = base_url.find('/') {
+            if base_url[slash_pos..].starts_with("//") {
+                // http:// oder https://
+                if let Some(end_pos) = base_url[slash_pos+2..].find('/') {
+                    &base_url[..slash_pos+2+end_pos]
+                } else {
+                    base_url
+                }
+            } else {
+                &base_url[..slash_pos]
+            }
+        } else {
+            base_url
+        };
+        
+        // Suche nach dem besten Mirror für diese Base-URL
+        if let Ok(Some(best_repo)) = Repository::select_best_mirror(self.conn(), base) {
+            // Verwende die beste Mirror-URL, aber behalte den ursprünglichen Pfad
+            if let Some(path_start) = base_url.find(base) {
+                let path = &base_url[path_start + base.len()..];
+                Ok(format!("{}{}", best_repo.url.trim_end_matches('/'), path))
+            } else {
+                Ok(best_repo.url)
+            }
+        } else {
+            // Keine Mirror-Metriken verfügbar, verwende ursprüngliche URL
+            Ok(base_url.to_string())
+        }
+    }
+    
+    /// Aktualisiert die Performance-Metriken für eine Mirror-URL nach einem Download
+    pub fn update_mirror_performance(&self, url: &str, rtt_ms: u64, _throughput: u64) -> Result<()> {
+        use crate::repo::Repository;
+        
+        // Extrahiere Base-URL
+        let base_url = if let Some(path_start) = url.find('/') {
+            if url[path_start..].starts_with("//") {
+                if let Some(end_pos) = url[path_start+2..].find('/') {
+                    &url[..path_start+2+end_pos]
+                } else {
+                    url
+                }
+            } else {
+                &url[..path_start]
+            }
+        } else {
+            url
+        };
+        
+        // Aktualisiere RTT (Throughput wird nicht in der DB gespeichert, nur RTT)
+        Repository::update_probe_stats(self.conn(), base_url, rtt_ms)?;
+        
+        Ok(())
+    }
+    
     /// Gibt alle installierten Pakete zurück
     #[allow(dead_code)]
     pub fn list_installed(&self) -> Result<Vec<String>> {

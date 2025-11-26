@@ -14,6 +14,7 @@ mod output;
 mod sandbox;
 mod security;
 mod delta;
+mod repo_generator;
 
 use cli::{Commands, RepoCommands, CacheAction, SecurityCommands};
 use std::path::Path;
@@ -101,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 RepoCommands::Update => {
                     cmd_repo_update(&index, &config, opts.verbose).await?;
+                }
+                RepoCommands::Generate { directory, suite, component, arch, key } => {
+                    cmd_repo_generate(directory, suite, component, arch, key.as_deref(), opts.verbose)?;
                 }
             }
         }
@@ -500,9 +504,12 @@ async fn cmd_install(
         })
         .collect();
     
-    // 3. Resolve dependencies using solver
+    // 3. Resolve dependencies using solver (with optional parallel solving)
     output::Output::section("🧩 Resolving dependencies...");
-    let solution = match solver.solve(&requested_specs) {
+    // Use parallel solver for better performance with large dependency graphs
+    // Can be disabled by setting use_parallel to false
+    let use_parallel_solver = jobs > 1; // Use parallel solver if multiple jobs are configured
+    let solution = match solver.solve_parallel(&requested_specs, use_parallel_solver) {
         Ok(sol) => sol,
         Err(e) => {
             output::Output::error(&format!("Dependency resolution failed: {}", e));
@@ -542,286 +549,133 @@ async fn cmd_install(
         return Ok(());
     }
     
-    // 3. Lade Pakete
-    output::Output::section("⬇ Downloading packages...");
+    // 3. Prefetch all packages in parallel before installation
+    output::Output::section("⬇ Prefetching packages...");
     
     let downloader = downloader::Downloader::new(jobs)?;
     let cache = cache::Cache::new(config.cache_path())?;
     
-    for pkg in &packages_to_install {
-        // Check if package exists in cache and validate it's not corrupted
-        let cache_path_deb = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "deb");
-        let cache_path_apx = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "apx");
+    // Collect all download tasks
+    use futures::stream::{self, StreamExt};
+    let download_tasks: Vec<_> = packages_to_install.iter().map(|pkg| {
+        let pkg = pkg.clone();
+        let downloader = &downloader;
+        let cache = &cache;
+        let index = index;
+        let verbose = verbose;
         
-        let package_in_cache = if cache_path_deb.exists() {
-            // Try to validate the .deb file by checking if dpkg-deb can read it
-            let test_output = std::process::Command::new("dpkg-deb")
-                .arg("-I")
-                .arg(&cache_path_deb)
-                .output();
+        async move {
+            // Check if package exists in cache and validate it's not corrupted
+            let cache_path_deb = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "deb");
+            let cache_path_apx = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, "apx");
             
-            let dpkg_valid = if let Ok(output) = test_output {
-                output.status.success()
+            let package_in_cache = if cache_path_deb.exists() {
+                // Try to validate the .deb file by checking if dpkg-deb can read it
+                let test_output = std::process::Command::new("dpkg-deb")
+                    .arg("-I")
+                    .arg(&cache_path_deb)
+                    .output();
+                
+                let dpkg_valid = if let Ok(output) = test_output {
+                    output.status.success()
+                } else {
+                    false
+                };
+                
+                // Also check checksum if available
+                let checksum_valid = if !pkg.checksum.is_empty() {
+                    use sha2::{Sha256, Digest};
+                    use hex;
+                    if let Ok(package_data) = std::fs::read(&cache_path_deb) {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&package_data);
+                        let calculated_checksum = hex::encode(hasher.finalize());
+                        calculated_checksum == pkg.checksum
+                    } else {
+                        false
+                    }
+                } else {
+                    true // No checksum to validate
+                };
+                
+                // If file is corrupted (dpkg can't read it or checksum mismatch), delete it
+                if !dpkg_valid || !checksum_valid {
+                    if verbose {
+                        if !dpkg_valid {
+                            output::Output::warning(&format!("Package {} in cache is corrupted (dpkg-deb failed), deleting...", pkg.name));
+                        } else {
+                            output::Output::warning(&format!("Package {} in cache has checksum mismatch, deleting...", pkg.name));
+                        }
+                    }
+                    let _ = std::fs::remove_file(&cache_path_deb);
+                    false // Not in cache (anymore)
+                } else {
+                    true // Valid package in cache
+                }
+            } else if cache_path_apx.exists() {
+                true // Assume .apx files are valid if they exist
             } else {
                 false
             };
             
-            // Also check checksum if available
-            let checksum_valid = if !pkg.checksum.is_empty() {
-                use sha2::{Sha256, Digest};
-                use hex;
-                if let Ok(package_data) = std::fs::read(&cache_path_deb) {
-                    let mut hasher = Sha256::new();
-                    hasher.update(&package_data);
-                    let calculated_checksum = hex::encode(hasher.finalize());
-                    calculated_checksum == pkg.checksum
-                } else {
-                    false
-                }
-            } else {
-                true // No checksum to validate
-            };
-            
-            // If file is corrupted (dpkg can't read it or checksum mismatch), delete it
-            if !dpkg_valid || !checksum_valid {
+            if package_in_cache {
                 if verbose {
-                    if !dpkg_valid {
-                        output::Output::warning(&format!("Package {} in cache is corrupted (dpkg-deb failed), deleting...", pkg.name));
-                    } else {
-                        output::Output::warning(&format!("Package {} in cache has checksum mismatch, deleting...", pkg.name));
-                    }
+                    output::Output::info(&format!("Package {} already in cache", pkg.name));
                 }
-                let _ = std::fs::remove_file(&cache_path_deb);
-                false // Not in cache (anymore)
-            } else {
-                true // Valid package in cache
+                return Ok::<(), anyhow::Error>(());
             }
-        } else if cache_path_apx.exists() {
-            true // Assume .apx files are valid if they exist
-        } else {
-            false
-        };
-        
-        if package_in_cache {
-            output::Output::info(&format!("Package {} already in cache", pkg.name));
-            continue;
+            
+            // Download package
+            let repo_id = pkg.repo_id.ok_or_else(|| {
+                anyhow::anyhow!("Package {} has no repository ID", pkg.name)
+            })?;
+            
+            let repo_url = index.get_repo_url(repo_id)?
+                .ok_or_else(|| anyhow::anyhow!("Repository {} not found", repo_id))?;
+            
+            let filename = pkg.filename.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Package {} has no filename", pkg.name))?;
+            
+            // Select best mirror URL based on performance metrics
+            let base_download_url = format!("{}/{}", repo_url.trim_end_matches('/'), filename.trim_start_matches('/'));
+            let download_url = index.select_best_mirror_url(&base_download_url)?;
+            
+            output::Output::download_info(&pkg.name, &format_size(pkg.size));
+            
+            let temp_file = std::env::temp_dir().join(format!("apt-ng-download-{}-{}.tmp", 
+                pkg.name, pkg.version));
+            
+            // Download with performance tracking
+            let (rtt_ms, throughput) = downloader.download_file_with_metrics(&download_url, &temp_file).await?;
+            
+            // Update mirror performance metrics
+            if let Err(e) = index.update_mirror_performance(&download_url, rtt_ms, throughput) {
+                if verbose {
+                    output::Output::warning(&format!("Failed to update mirror performance: {}", e));
+                }
+            }
+            
+            // Move to cache with deduplication
+            let ext = filename.split('.').last().unwrap_or("deb");
+            cache.add_package_from_file(&pkg.name, &pkg.version, &pkg.arch, ext, &temp_file)?;
+            std::fs::remove_file(&temp_file)?;
+            
+            Ok(())
         }
-        
-        // Skip packages without filename - they might be virtual packages or already installed
-        if pkg.filename.is_none() {
-            // Check if package is already installed on the system
-            let output = std::process::Command::new("dpkg-query")
-                .arg("-W")
-                .arg("-f=${Status}")
-                .arg(&pkg.name)
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if stdout.contains("installed") {
-                        output::Output::info(&format!("Package {} is already installed, skipping download", pkg.name));
-                        continue;
-                    }
-                }
-            }
-            
-            // Try to get filename from apt-cache as fallback
-            let mut found_filename = None;
-            
-            // Try apt-cache show and find matching version
-            let output = std::process::Command::new("apt-cache")
-                .arg("show")
-                .arg(&pkg.name)
-                .output();
-            
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let mut in_correct_version = false;
-                    let mut fallback_filename = None;
-                    let mut fallback_version = None;
-                    
-                    for line in stdout.lines() {
-                        if line.starts_with("Package:") {
-                            in_correct_version = false;
-                        } else if line.starts_with("Version:") {
-                            let version = line.split(':').nth(1).map(|s| s.trim().to_string());
-                            if let Some(version) = version {
-                                in_correct_version = version == pkg.version;
-                                // Store first available version as fallback
-                                if fallback_filename.is_none() {
-                                    fallback_version = Some(version);
-                                }
-                            }
-                        } else if line.starts_with("Filename:") {
-                            let filename = line.split(':').nth(1).map(|s| s.trim().to_string());
-                            if let Some(filename) = filename {
-                                if in_correct_version {
-                                    found_filename = Some(filename);
-                                    break;
-                                } else if fallback_filename.is_none() {
-                                    fallback_filename = Some(filename);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Use fallback if exact version not found
-                    if found_filename.is_none() && fallback_filename.is_some() {
-                        found_filename = fallback_filename;
-                        if verbose {
-                            output::Output::warning(&format!(
-                                "Package {} version {} not found in apt-cache, using version {} instead",
-                                pkg.name, pkg.version, fallback_version.as_ref().unwrap_or(&"unknown".to_string())
-                            ));
-                        }
-                    }
-                }
-            }
-            
-            if let Some(filename) = found_filename {
-                // Use the filename from apt-cache
-                let repo_id = pkg.repo_id.ok_or_else(|| {
-                    anyhow::anyhow!("Package {} has no repository ID", pkg.name)
-                })?;
-                
-                let repo_url = index.get_repo_url(repo_id)?
-                    .ok_or_else(|| anyhow::anyhow!("Repository {} not found", repo_id))?;
-                
-                let download_url = format!("{}/{}", repo_url.trim_end_matches('/'), filename.trim_start_matches('/'));
-                
-                output::Output::download_info(&pkg.name, &format_size(pkg.size));
-                
-                let temp_file = std::env::temp_dir().join(format!("apt-ng-download-{}-{}.tmp", 
-                    pkg.name, pkg.version));
-                
-                downloader.download_file(&download_url, &temp_file).await?;
-                
-                let package_dir = cache.cache_dir.join("packages");
-                std::fs::create_dir_all(&package_dir)?;
-                
-                let ext = filename.split('.').last().unwrap_or("deb");
-                let cache_path_with_ext = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, ext);
-                std::fs::copy(&temp_file, &cache_path_with_ext)?;
-                std::fs::remove_file(&temp_file)?;
-                continue;
-            }
-            
-            return Err(anyhow::anyhow!("Package {} has no filename and could not be found in apt-cache", pkg.name));
-        }
-        
-        // Konstruiere Download-URL
-        let repo_id = pkg.repo_id.ok_or_else(|| {
-            anyhow::anyhow!("Package {} has no repository ID", pkg.name)
-        })?;
-        
-        let repo_url = index.get_repo_url(repo_id)?
-            .ok_or_else(|| anyhow::anyhow!("Repository {} not found", repo_id))?;
-        
-        let filename = pkg.filename.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Package {} has no filename", pkg.name))?;
-        
-        let download_url = format!("{}/{}", repo_url.trim_end_matches('/'), filename.trim_start_matches('/'));
-        
-        // Check for delta update availability and calculate delta if possible
-        let mut use_delta = false;
-        
-        if let Ok(installed_packages) = index.list_installed_packages_with_manifests() {
-            if let Some(installed_pkg) = installed_packages.iter().find(|ip| ip.name == pkg.name) {
-                use crate::delta::DeltaCalculator;
-                
-                // Check if delta is available
-                if DeltaCalculator::delta_available(&pkg.name, &installed_pkg.version, &pkg.version) {
-                    // Try to calculate delta from cached old version
-                    let old_cache_path = cache.package_path_with_ext(&pkg.name, &installed_pkg.version, &pkg.arch, "deb");
-                    if old_cache_path.exists() {
-                        // For now, we'll download full package and calculate delta later
-                        // In production, would check repository for pre-calculated delta
-                        use_delta = true;
-                    }
-                }
-            }
-        }
-        
-        output::Output::download_info(&pkg.name, &format_size(pkg.size));
-        
-        // Lade Paket herunter
-        let temp_file = std::env::temp_dir().join(format!("apt-ng-download-{}-{}.tmp", 
-            pkg.name, pkg.version));
-        
-        downloader.download_file(&download_url, &temp_file).await?;
-        
-        // If delta was requested, calculate it now (for demonstration)
-        if use_delta {
-            if let Ok(installed_packages) = index.list_installed_packages_with_manifests() {
-                if let Some(installed_pkg) = installed_packages.iter().find(|ip| ip.name == pkg.name) {
-                    use crate::delta::DeltaCalculator;
-                    let old_cache_path = cache.package_path_with_ext(&pkg.name, &installed_pkg.version, &pkg.arch, "deb");
-                    if old_cache_path.exists() {
-                        match DeltaCalculator::calculate_delta(&old_cache_path, &temp_file, "simple") {
-                            Ok((delta_data, metadata)) => {
-                                // Check if delta is worthwhile
-                                if metadata.is_worthwhile() {
-                                    if verbose {
-                                        output::Output::info(&format!(
-                                            "Delta calculated: {}% savings ({:.2}MB -> {:.2}MB)",
-                                            metadata.savings_percentage(),
-                                            metadata.full_size as f64 / 1_000_000.0,
-                                            metadata.delta_size as f64 / 1_000_000.0
-                                        ));
-                                    }
-                                    // Store delta file
-                                    let delta_file = std::env::temp_dir().join(format!("apt-ng-delta-{}-{}.delta", 
-                                        pkg.name, pkg.version));
-                                    std::fs::write(&delta_file, delta_data)?;
-                                    
-                                    // Apply delta to reconstruct full package
-                                    use crate::delta::DeltaApplier;
-                                    match DeltaApplier::apply_delta(&old_cache_path, &delta_file, &temp_file, &metadata) {
-                                        Ok(_) => {
-                                            if verbose {
-                                                output::Output::info(&format!("Delta applied successfully for {}", pkg.name));
-                                            }
-                                            // Clean up delta file
-                                            let _ = std::fs::remove_file(&delta_file);
-                                        }
-                                        Err(e) => {
-                                            if verbose {
-                                                output::Output::warning(&format!("Failed to apply delta for {}: {}, using full download", pkg.name, e));
-                                            }
-                                            // Fall back to full download (already downloaded)
-                                        }
-                                    }
-                                } else {
-                                    if verbose {
-                                        output::Output::info(&format!("Delta not worthwhile (only {:.1}% savings), using full download", metadata.savings_percentage()));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    output::Output::warning(&format!("Failed to calculate delta for {}: {}, using full download", pkg.name, e));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Verschiebe in Cache - bestimme Extension basierend auf Dateiname
-        let package_dir = cache.cache_dir.join("packages");
-        std::fs::create_dir_all(&package_dir)?;
-        
-        // Bestimme Extension aus filename oder verwende .deb als Fallback
-        let ext = filename.split('.').last().unwrap_or("deb");
-        let cache_path_with_ext = cache.package_path_with_ext(&pkg.name, &pkg.version, &pkg.arch, ext);
-        std::fs::copy(&temp_file, &cache_path_with_ext)?;
-        std::fs::remove_file(&temp_file)?;
+    }).collect();
+    
+    // Execute all downloads in parallel
+    let results: Vec<_> = stream::iter(download_tasks)
+        .buffer_unordered(jobs)
+        .collect()
+        .await;
+    
+    // Check for errors
+    for result in results {
+        result?;
     }
     
-    // 4. Verifiziere Signaturen
+    // 4. Download phase complete, now verify signatures
     output::Output::section("🔐 Verifying package signatures...");
     let verifier = verifier::PackageVerifier::new(config.trusted_keys_dir())?;
     
@@ -896,7 +750,7 @@ async fn cmd_install(
         }
     }
     
-    // 5. Installiere Pakete
+    // 6. Installiere Pakete
     output::Output::section("🔧 Installing packages...");
     
     let installer = installer::Installer::new(jobs, Path::new("/"));
@@ -1089,7 +943,9 @@ async fn cmd_upgrade(
         .collect();
     
     output::Output::section("🧩 Resolving dependencies for upgrades...");
-    let solution = match solver.solve(&upgrade_specs) {
+    // Use parallel solver for better performance
+    let use_parallel_solver = jobs > 1;
+    let solution = match solver.solve_parallel(&upgrade_specs, use_parallel_solver) {
         Ok(sol) => sol,
         Err(e) => {
             output::Output::error(&format!("Dependency resolution for upgrade failed: {}", e));
@@ -1271,6 +1127,66 @@ async fn cmd_repo_update(index: &index::Index, config: &config::Config, verbose:
             output::Output::list_item(&format!("{}: score {:.2}", url, stats.score()));
         }
     }
+    
+    Ok(())
+}
+
+fn cmd_repo_generate(
+    directory: &str,
+    suite: &str,
+    component: &str,
+    arch: &str,
+    key: Option<&str>,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    use crate::repo_generator::{RepositoryIndexGenerator, RepositorySigner};
+    
+    output::Output::heading("📦 Generating Repository Index");
+    
+    let package_dir = Path::new(directory);
+    if !package_dir.exists() {
+        return Err(anyhow::anyhow!("Directory does not exist: {}", directory));
+    }
+    
+    if verbose {
+        output::Output::info(&format!("Scanning directory: {}", directory));
+        output::Output::info(&format!("Suite: {}, Component: {}, Arch: {}", suite, component, arch));
+    }
+    
+    // Create output directory structure
+    let output_dir = package_dir.join("dists").join(suite).join(component).join(format!("binary-{}", arch));
+    std::fs::create_dir_all(&output_dir)?;
+    
+    // Generate Packages file
+    let generator = RepositoryIndexGenerator::new(package_dir, suite, component, arch);
+    let packages_path = output_dir.join("Packages");
+    generator.generate_packages_file(&packages_path)?;
+    
+    if verbose {
+        output::Output::success(&format!("Generated Packages file: {:?}", packages_path));
+    }
+    
+    // Generate Release file
+    let release_dir = package_dir.join("dists").join(suite);
+    std::fs::create_dir_all(&release_dir)?;
+    let release_path = release_dir.join("Release");
+    generator.generate_release_file(&packages_path, &release_path)?;
+    
+    if verbose {
+        output::Output::success(&format!("Generated Release file: {:?}", release_path));
+    }
+    
+    // Sign Release file if key provided
+    if let Some(key_path) = key {
+        let signer = RepositorySigner::from_key_file(Path::new(key_path))?;
+        signer.sign_release(&release_path, &release_dir)?;
+        
+        if verbose {
+            output::Output::success("Signed Release file");
+        }
+    }
+    
+    output::Output::success("Repository index generated successfully");
     
     Ok(())
 }

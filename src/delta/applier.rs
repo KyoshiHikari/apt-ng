@@ -3,12 +3,15 @@ use std::path::Path;
 use crate::delta::format::DeltaMetadata;
 use sha2::{Sha256, Digest};
 use hex;
+use xdelta3::decode;
 
 /// Applies delta patches to reconstruct files
+#[allow(dead_code)]
 pub struct DeltaApplier;
 
 impl DeltaApplier {
     /// Apply delta to reconstruct target file
+    #[allow(dead_code)]
     pub fn apply_delta(
         base_file: &Path,
         delta_file: &Path,
@@ -31,8 +34,17 @@ impl DeltaApplier {
             ));
         }
         
-        // Apply delta (placeholder - would use bsdiff/xdelta3 in production)
-        let reconstructed_data = Self::simple_apply(&base_data, &delta_data)?;
+        // Apply delta using xdelta3
+        let reconstructed_data = Self::xdelta3_decode(&base_data, &delta_data)?;
+        
+        // Verify reconstructed file matches expected size
+        if reconstructed_data.len() as u64 != metadata.full_size {
+            return Err(anyhow::anyhow!(
+                "Reconstructed file size mismatch: expected {}, got {}",
+                metadata.full_size,
+                reconstructed_data.len()
+            ));
+        }
         
         // Write output file
         std::fs::write(output_file, reconstructed_data)?;
@@ -40,15 +52,28 @@ impl DeltaApplier {
         Ok(())
     }
     
-    /// Simple delta application (placeholder)
-    fn simple_apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
-        // This is a placeholder implementation
-        // In production, would use bsdiff or xdelta3 crate
-        // For now, if delta is empty, return base; otherwise return delta as full file
+    /// Decode delta using xdelta3
+    /// Parameters: base = old file, delta = delta data
+    /// Returns: reconstructed new file
+    #[allow(dead_code)]
+    fn xdelta3_decode(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+        // Handle edge cases
         if delta.is_empty() {
-            Ok(base.to_vec())
-        } else {
-            Ok(delta.to_vec())
+            return Ok(base.to_vec());
+        }
+        
+        if base.is_empty() {
+            // If base is empty, delta should contain the full file
+            return Ok(delta.to_vec());
+        }
+        
+        // Use xdelta3 to decode the delta
+        // decode(input=delta, src=base) -> reconstructed
+        match decode(delta, base) {
+            Some(reconstructed) => Ok(reconstructed),
+            None => {
+                anyhow::bail!("xdelta3 decoding failed: unable to reconstruct file from delta");
+            }
         }
     }
     
@@ -56,15 +81,29 @@ impl DeltaApplier {
     #[allow(dead_code)]
     pub fn verify_delta_applicable(
         base_file: &Path,
-        _metadata: &DeltaMetadata,
+        metadata: &DeltaMetadata,
     ) -> Result<bool> {
-        // Check if base file exists and matches expected from_version
+        // Check if base file exists
         if !base_file.exists() {
             return Ok(false);
         }
         
-        // In production, would verify version matches metadata.from_version
-        // For now, just check file exists
+        // Check if base file size is reasonable (not empty, not too large)
+        let base_metadata = std::fs::metadata(base_file)?;
+        if base_metadata.len() == 0 {
+            return Ok(false);
+        }
+        
+        // Verify algorithm matches
+        if metadata.algorithm != "xdelta3" {
+            return Ok(false);
+        }
+        
+        // In a full implementation, we would also:
+        // 1. Verify base file version matches metadata.from_version
+        // 2. Check base file checksum if available
+        // 3. Verify delta file integrity
+        
         Ok(true)
     }
 }

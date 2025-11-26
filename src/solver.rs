@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use crate::package::PackageManifest;
 use crate::apt_parser::parse_dependency_rule;
 
@@ -149,6 +150,28 @@ impl DependencySolver {
     /// Löst Abhängigkeiten für die angeforderten Pakete
     #[allow(dead_code)]
     pub fn solve(&self, requested: &[PackageSpec]) -> Result<Solution> {
+        self.solve_parallel(requested, false)
+    }
+    
+    /// Löst Abhängigkeiten für die angeforderten Pakete mit optionaler Parallelisierung
+    /// 
+    /// # Arguments
+    /// * `requested` - Liste der angeforderten Pakete
+    /// * `use_parallel` - Wenn true, verwendet parallele Verarbeitung für Dependency-Resolution
+    /// 
+    /// # Parallelisierung
+    /// Wenn `use_parallel` aktiviert ist, werden mehrere Dependency-Resolutionen parallel durchgeführt.
+    /// Dies kann die Performance bei großen Dependency-Graphen verbessern.
+    pub fn solve_parallel(&self, requested: &[PackageSpec], use_parallel: bool) -> Result<Solution> {
+        if use_parallel {
+            self.solve_parallel_impl(requested)
+        } else {
+            self.solve_sequential(requested)
+        }
+    }
+    
+    /// Sequenzielle Dependency-Resolution (Standard)
+    fn solve_sequential(&self, requested: &[PackageSpec]) -> Result<Solution> {
         let mut to_install = Vec::new();
         let mut visited = HashSet::new();
         let mut conflicts = Vec::new();
@@ -184,6 +207,170 @@ impl DependencySolver {
             to_remove: Vec::new(),
             to_upgrade: Vec::new(),
         })
+    }
+    
+    /// Parallele Dependency-Resolution mit rayon
+    fn solve_parallel_impl(&self, requested: &[PackageSpec]) -> Result<Solution> {
+        use rayon::prelude::*;
+        
+        // Thread-safe Collections für parallele Zugriffe
+        let to_install = Arc::new(Mutex::new(Vec::new()));
+        let visited = Arc::new(Mutex::new(HashSet::new()));
+        let conflicts = Arc::new(Mutex::new(Vec::new()));
+        
+        // Parallele Verarbeitung der angeforderten Pakete
+        let results: Result<Vec<()>> = requested.par_iter()
+            .map(|spec| {
+                if let Some(packages) = self.packages.get(&spec.name) {
+                    // Wähle die passende Version
+                    let pkg = self.select_best_version(packages, spec)?;
+                    
+                    // Prüfe ob bereits besucht
+                    let visited_guard = visited.lock().unwrap();
+                    if !visited_guard.contains(&pkg.name) {
+                        drop(visited_guard);
+                        
+                        // Resolve dependencies (thread-safe)
+                        self.resolve_dependencies_parallel(
+                            &pkg,
+                            &to_install,
+                            &visited,
+                            &conflicts,
+                        )?;
+                    } else {
+                        // Package was already visited, but we still need to add it if requested
+                        let mut to_install_guard = to_install.lock().unwrap();
+                        if !to_install_guard.iter().any(|p| p.name == pkg.name) {
+                            to_install_guard.push(pkg.clone());
+                        }
+                    }
+                    
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Package not found: {}", spec.name))
+                }
+            })
+            .collect();
+        
+        results?;
+        
+        // Sammle Ergebnisse
+        let to_install = Arc::try_unwrap(to_install).unwrap().into_inner().unwrap();
+        let conflicts = Arc::try_unwrap(conflicts).unwrap().into_inner().unwrap();
+        
+        // Prüfe auf Konflikte
+        if !conflicts.is_empty() {
+            return Err(anyhow::anyhow!("Conflicts detected: {:?}", conflicts));
+        }
+        
+        Ok(Solution {
+            to_install,
+            to_remove: Vec::new(),
+            to_upgrade: Vec::new(),
+        })
+    }
+    
+    /// Parallele Version von resolve_dependencies mit thread-safe Collections
+    fn resolve_dependencies_parallel(
+        &self,
+        pkg: &PackageInfo,
+        to_install: &Arc<Mutex<Vec<PackageInfo>>>,
+        visited: &Arc<Mutex<HashSet<String>>>,
+        conflicts: &Arc<Mutex<Vec<String>>>,
+    ) -> Result<()> {
+        // Prüfe ob bereits besucht
+        {
+            let mut visited_guard = visited.lock().unwrap();
+            if visited_guard.contains(&pkg.name) {
+                return Ok(());
+            }
+            visited_guard.insert(pkg.name.clone());
+        }
+        
+        // Prüfe Konflikte
+        {
+            let to_install_guard = to_install.lock().unwrap();
+            for conflict in &pkg.conflicts {
+                if to_install_guard.iter().any(|p| p.name == *conflict) {
+                    let mut conflicts_guard = conflicts.lock().unwrap();
+                    conflicts_guard.push(format!("{} conflicts with {}", pkg.name, conflict));
+                }
+            }
+        }
+        
+        // Parallele Verarbeitung der Dependencies mit rayon
+        use rayon::prelude::*;
+        
+        let dep_results: Result<Vec<()>> = pkg.depends.par_iter()
+            .map(|dep| {
+                // Check if dependency is already satisfied by an installed package
+                if self.is_dependency_satisfied_by_installed(dep) {
+                    return Ok(()); // Skip this dependency
+                }
+                
+                // Try to find package by name
+                if let Some(packages) = self.packages.get(&dep.name) {
+                    let dep_pkg = self.select_best_version(packages, &PackageSpec {
+                        name: dep.name.clone(),
+                        version: dep.version_constraint.clone(),
+                        arch: dep.arch.clone(),
+                    })?;
+                    
+                    self.resolve_dependencies_parallel(dep_pkg, to_install, visited, conflicts)?;
+                } else {
+                    // Check if any package provides this dependency
+                    // Parallele Suche durch alle Pakete
+                    let mut found = false;
+                    let packages_vec: Vec<_> = self.packages.iter().collect();
+                    
+                    for (_, pkgs) in &packages_vec {
+                        for pkg_candidate in pkgs.iter() {
+                            let provides_dep = pkg_candidate.name == dep.name || 
+                                              pkg_candidate.provides.contains(&dep.name);
+                            
+                            if provides_dep {
+                                // Check version constraint if specified
+                                if let Some(ref constraint) = dep.version_constraint {
+                                    if !Self::version_matches(&pkg_candidate.version, constraint) {
+                                        continue;
+                                    }
+                                }
+                                self.resolve_dependencies_parallel(pkg_candidate, to_install, visited, conflicts)?;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found {
+                            break;
+                        }
+                    }
+                    
+                    if !found {
+                        // Last resort: check if dependency is satisfied by a system package
+                        if Self::is_package_installed_on_system(&dep.name) || 
+                           Self::is_dependency_provided_by_system(&dep.name) {
+                            return Ok(()); // Dependency satisfied by system package
+                        }
+                        
+                        return Err(anyhow::anyhow!("Dependency not found: {}", dep.name));
+                    }
+                }
+                
+                Ok(())
+            })
+            .collect();
+        
+        dep_results?;
+        
+        // Füge Paket hinzu, wenn noch nicht vorhanden
+        {
+            let mut to_install_guard = to_install.lock().unwrap();
+            if !to_install_guard.iter().any(|p| p.name == pkg.name) {
+                to_install_guard.push(pkg.clone());
+            }
+        }
+        
+        Ok(())
     }
     
     #[allow(dead_code)]
@@ -325,6 +512,30 @@ impl DependencySolver {
     }
     
     /// Check if a package is installed on the system (via dpkg)
+    /// Get version of a system package using dpkg -l
+    fn get_system_package_version(package_name: &str) -> Option<String> {
+        use std::process::Command;
+        
+        // Use dpkg-query to get version
+        let output = Command::new("dpkg-query")
+            .arg("-W")
+            .arg("-f=${Version}")
+            .arg(package_name)
+            .output();
+        
+        match output {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !version.is_empty() {
+                    Some(version)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    
     fn is_package_installed_on_system(package_name: &str) -> bool {
         // Check if package is installed using dpkg-query
         let output = Command::new("dpkg-query")
@@ -470,10 +681,15 @@ impl DependencySolver {
         // Check if dependency is satisfied by a system package (not managed by apt-ng)
         // This handles cases where packages are installed via apt/dpkg but not tracked by apt-ng
         if Self::is_package_installed_on_system(&dep.name) {
-            // If version constraint specified, we can't easily check it without querying dpkg
-            // For now, assume it's satisfied if the package is installed
-            // TODO: Could enhance this to check version constraints using dpkg -l output
-            return true;
+            // Check version constraint if specified
+            if let Some(ref constraint) = dep.version_constraint {
+                if let Some(installed_version) = Self::get_system_package_version(&dep.name) {
+                    if !Self::version_matches(&installed_version, constraint) {
+                        return false; // Version constraint not satisfied
+                    }
+                }
+            }
+            return true; // Package is installed and version matches (if constraint specified)
         }
         
         // Check if any system package provides this dependency

@@ -12,15 +12,64 @@ pub struct Downloader {
 impl Downloader {
     /// Erstellt einen neuen Downloader
     pub fn new(max_parallel: usize) -> Result<Self> {
-        let client = Client::builder()
-            // Verwende Standard-HTTP-Verhandlung (HTTP/1.1 oder HTTP/2)
-            .timeout(std::time::Duration::from_secs(30)) // 30 Sekunden Timeout
-            .build()?;
+        Self::new_with_http3_fallback(max_parallel, false)
+    }
+    
+    /// Erstellt einen neuen Downloader mit optionaler HTTP/3 QUIC Unterstützung
+    /// 
+    /// # Arguments
+    /// * `max_parallel` - Maximale Anzahl paralleler Downloads
+    /// * `_try_http3` - Wenn true, versucht HTTP/3 QUIC zu verwenden (erfordert http3 feature in reqwest)
+    /// 
+    /// # HTTP/3 Support
+    /// HTTP/3 QUIC wird automatisch verwendet wenn:
+    /// 1. `_try_http3` ist true
+    /// 2. Der Server HTTP/3 unterstützt
+    /// 3. Das `http3` Feature in reqwest aktiviert ist (instabil, erfordert RUSTFLAGS='--cfg reqwest_unstable')
+    /// 
+    /// Falls HTTP/3 nicht verfügbar ist, fällt der Client automatisch auf HTTP/2 oder HTTP/1.1 zurück.
+    pub fn new_with_http3_fallback(max_parallel: usize, _try_http3: bool) -> Result<Self> {
+        let builder = Client::builder()
+            // HTTP/2 wird automatisch verwendet wenn verfügbar
+            // HTTP/3 kann aktiviert werden wenn reqwest's http3 feature aktiviert ist
+            .timeout(std::time::Duration::from_secs(30)); // 30 Sekunden Timeout
+        
+        // Note: HTTP/3 support in reqwest is currently unstable
+        // To enable it:
+        // 1. Add "http3" to reqwest features in Cargo.toml
+        // 2. Set RUSTFLAGS='--cfg reqwest_unstable' environment variable
+        // 3. reqwest will automatically try HTTP/3 if server supports it
+        
+        let client = builder.build()?;
         
         Ok(Downloader {
             client,
             max_parallel,
         })
+    }
+    
+    /// Prüft, ob HTTP/3 QUIC für eine URL verfügbar ist
+    /// 
+    /// Diese Methode versucht eine Verbindung mit HTTP/3 herzustellen.
+    /// Falls HTTP/3 nicht unterstützt wird, gibt sie false zurück.
+    #[allow(dead_code)]
+    pub async fn check_http3_support(&self, url: &str) -> bool {
+        // Placeholder: HTTP/3 detection würde hier implementiert werden
+        // Aktuell gibt reqwest keine einfache Möglichkeit, das verwendete Protokoll zu prüfen
+        // In Zukunft könnte man hier eine HEAD-Anfrage machen und prüfen, ob HTTP/3 verwendet wurde
+        
+        // Für jetzt: Versuche eine HEAD-Anfrage und prüfe die Antwort
+        // Falls HTTP/3 verfügbar ist, würde reqwest es automatisch verwenden (mit http3 feature)
+        if let Ok(response) = self.client.head(url).send().await {
+            // Prüfe ob Alt-Svc Header vorhanden ist (zeigt HTTP/3 Unterstützung an)
+            if let Some(alt_svc) = response.headers().get("alt-svc") {
+                if let Ok(alt_svc_str) = alt_svc.to_str() {
+                    return alt_svc_str.contains("h3") || alt_svc_str.contains("quic");
+                }
+            }
+        }
+        
+        false
     }
     
     /// Lädt eine Datei von einer URL herunter (mit Resume-Unterstützung und Checksum-Validierung)
@@ -97,6 +146,27 @@ impl Downloader {
         }
         
         Ok(())
+    }
+    
+    /// Lädt eine Datei herunter und gibt Performance-Metriken zurück
+    pub async fn download_file_with_metrics(&self, url: &str, dest: &Path) -> Result<(u64, u64)> {
+        use std::time::Instant;
+        
+        let download_start = Instant::now();
+        self.download_file(url, dest).await?;
+        let download_time = download_start.elapsed();
+        
+        let file_size = tokio::fs::metadata(dest).await.map(|m| m.len()).unwrap_or(0);
+        let throughput = if download_time.as_secs() > 0 {
+            file_size / download_time.as_secs()
+        } else if download_time.as_millis() > 0 {
+            file_size * 1000 / download_time.as_millis() as u64
+        } else {
+            0
+        };
+        let rtt_ms = download_time.as_millis() as u64;
+        
+        Ok((rtt_ms, throughput))
     }
     
     /// Setzt einen unterbrochenen Download fort

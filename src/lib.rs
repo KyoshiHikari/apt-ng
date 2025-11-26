@@ -15,4 +15,7 @@ pub mod sandbox;
 pub mod benchmark;
 pub mod security;
 pub mod delta;
+pub mod apx_builder;
+pub mod repo_generator;
+pub mod repo_server;
 
