@@ -88,19 +88,25 @@ async fn main() -> anyhow::Result<()> {
     // Führe Command aus
     match &opts.command {
         Commands::Update => {
-            cmd_update(&index, &config, opts.verbose).await?;
+            // Use max jobs if -j not specified, otherwise use config.jobs() which respects config file
+            let jobs = opts.jobs.unwrap_or_else(|| config.jobs());
+            cmd_update(&index, &config, jobs, opts.verbose).await?;
         }
         Commands::Search { term } => {
             cmd_search(&index, term, opts.verbose)?;
         }
         Commands::Install { packages } => {
-            cmd_install(&index, &config, packages, opts.jobs.unwrap_or(config.jobs()), opts.dry_run, opts.verbose).await?;
+            // Use max jobs if -j not specified, otherwise use config.jobs() which respects config file
+            let jobs = opts.jobs.unwrap_or_else(|| config.jobs());
+            cmd_install(&index, &config, packages, jobs, opts.dry_run, opts.verbose).await?;
         }
         Commands::Remove { packages } => {
             cmd_remove(&index, packages, opts.dry_run, opts.verbose).await?;
         }
         Commands::Upgrade => {
-            cmd_upgrade(&index, &config, opts.jobs.unwrap_or(config.jobs()), opts.dry_run, opts.verbose).await?;
+            // Use max jobs if -j not specified, otherwise use config.jobs() which respects config file
+            let jobs = opts.jobs.unwrap_or_else(|| config.jobs());
+            cmd_upgrade(&index, &config, jobs, opts.dry_run, opts.verbose).await?;
         }
         Commands::Show { package } => {
             cmd_show(&index, package, opts.verbose)?;
@@ -140,8 +146,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_update(index: &index::Index, config: &config::Config, verbose: bool) -> anyhow::Result<()> {
+async fn cmd_update(index: &index::Index, config: &config::Config, jobs: usize, verbose: bool) -> anyhow::Result<()> {
     output::Output::heading("🔄 Updating Package Index");
+    
+    if verbose {
+        output::Output::info(&format!("Using {} parallel workers", jobs));
+    }
     
     // Versuche apt-Repositories zu importieren, falls noch keine vorhanden sind
     let imported = repo::Repository::import_apt_repos(index.conn())?;
@@ -173,7 +183,7 @@ async fn cmd_update(index: &index::Index, config: &config::Config, verbose: bool
     }
     
     // Lade Metadaten von Repositories
-    let downloader = downloader::Downloader::new(config.jobs())?;
+    let downloader = downloader::Downloader::new(jobs)?;
     let mut total_packages = 0;
     
     // Erkenne Debian-Suite automatisch
@@ -1103,13 +1113,18 @@ fn cmd_repo_add(index: &index::Index, url: &str) -> anyhow::Result<()> {
 }
 
 async fn cmd_repo_update(index: &index::Index, config: &config::Config, verbose: bool) -> anyhow::Result<()> {
+    // Use jobs() which respects config file, defaults to max CPU cores
+    let jobs = config.jobs();
+    if verbose {
+        output::Output::info(&format!("Using {} parallel workers", jobs));
+    }
     output::Output::heading("🔄 Updating Repository Mirrors");
     
     let repos = repo::Repository::load_all(index.conn())?;
     
     output::Output::info(&format!("Probing {} mirrors...", repos.len()));
     
-    let downloader = downloader::Downloader::new(config.jobs())?;
+    let downloader = downloader::Downloader::new(jobs)?;
     let mut mirror_stats = Vec::new();
     
     for repo in &repos {

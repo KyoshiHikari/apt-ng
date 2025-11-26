@@ -10,8 +10,10 @@ This document lists all components and their implementation status.
 * [x] `remove` – Uninstallation routine + consistency check
 * [x] `upgrade` – Upgrades for all installed packages (fully implemented with dependency resolution)
 * [x] `show` – Display package information from database
-* [x] `repo add/remove` – Repository management
+* [x] `repo add/update/generate` – Repository management
 * [x] `cache clean` – Cache cleanup
+* [x] `security audit` – Security checks and audit reports
+* [x] `self-update` – Automatic update checking and installation via GitHub Releases
 
 ---
 
@@ -94,6 +96,8 @@ This document lists all components and their implementation status.
 * [x] Default paths (Linux: /etc/apt-ng, /var/lib/apt-ng, /var/cache/apt-ng)
 * [x] Job settings (worker count etc.)
 * [x] Sandbox configuration (enabled, network_allowed, memory_limit, cpu_limit)
+* [x] Automatic detection of maximum CPU cores for parallel workers
+* [x] Configurable parallel worker count (defaults to max CPU cores)
 
 ---
 
@@ -124,5 +128,8 @@ This document lists all components and their implementation status.
 * [x] Prefetching based on solver results (parallel downloads before installation)
 * [x] Adaptive mirror selection with learning algorithm (RTT and throughput tracking)
 * [x] Parallel SAT solver (experimental, using rayon for parallel dependency resolution)
+* [x] Automatic maximum parallel workers (uses all available CPU cores by default)
+* [x] Self-update mechanism with SHA256 checksum verification
+* [x] Background update checking on every command execution
 
 ---

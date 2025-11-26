@@ -35,6 +35,13 @@ Diese Features sind wichtig für die Stabilität und Zuverlässigkeit von apt-ng
   - Netzwerk-Zugriffskontrolle
   - Dateisystem-Sandboxing
 
+- [x] **Self-Update Mechanismus**
+  - Automatische Update-Prüfung bei jedem Befehl
+  - SHA256-basierte Versionsprüfung
+  - GitHub Releases API Integration
+  - Atomische Binary-Installation
+  - Non-blocking Hintergrund-Check mit Timeout
+
 ## 🗃 Cache-Management
 
 - [x] **Delta-Updates**
@@ -110,6 +117,12 @@ Diese Features wurden implementiert, um die Performance weiter zu verbessern:
   - Experimentelle Implementierung
   - Automatische Aktivierung wenn `jobs > 1`
 
+- [x] **Automatische Maximale Parallele Worker**
+  - Automatische Erkennung der maximalen CPU-Kerne
+  - Standardmäßig werden alle verfügbaren CPU-Kerne verwendet
+  - Optimale Performance ohne manuelle Konfiguration
+  - Konfigurierbar via `-j` Flag falls gewünscht
+
 ## 📝 Priorisierung
 
 ### ✅ Abgeschlossen (Hohe Priorität)
@@ -130,6 +143,11 @@ Diese Features wurden implementiert, um die Performance weiter zu verbessern:
    - ✅ Prefetching
    - ✅ Adaptive Mirror Selection
    - ✅ Paralleler SAT-Solver
+   - ✅ Automatische Maximale Parallele Worker
+10. ✅ Self-Update Mechanismus
+    - ✅ SHA256-basierte Update-Prüfung
+    - ✅ Automatische Hintergrund-Prüfung
+    - ✅ GitHub Releases Integration
 
 ### 🔮 Zukünftige Features
 - CDN-Layout für Produktivumgebungen
@@ -140,10 +158,10 @@ Diese Features wurden implementiert, um die Performance weiter zu verbessern:
 **Status:** 🎉 Alle geplanten Features wurden erfolgreich implementiert!
 
 - ✅ Tests & Qualitätssicherung: 100% abgeschlossen
-- ✅ Sicherheit: 100% abgeschlossen
+- ✅ Sicherheit: 100% abgeschlossen (inkl. Self-Update)
 - ✅ Cache-Management: 100% abgeschlossen
 - ✅ Repository-Server: 75% abgeschlossen (CDN-Layout optional)
-- ✅ Performance-Optimierungen: 100% abgeschlossen
+- ✅ Performance-Optimierungen: 100% abgeschlossen (inkl. Auto-Parallelisierung)
 
 ## 🔗 Verwandte Dokumentation
 

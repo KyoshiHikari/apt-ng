@@ -86,12 +86,29 @@ impl Config {
     }
     
     /// Gibt die Anzahl der Worker-Threads zurück
+    /// 
+    /// Gibt immer die maximale Anzahl verfügbarer CPU-Kerne zurück.
+    /// Die Config-Einstellung wird ignoriert, um automatisch die beste Performance zu erzielen.
+    /// 
+    /// Dies ist die Standardmethode für alle Befehle (update, install, upgrade).
     pub fn jobs(&self) -> usize {
-        self.jobs.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get() * 2)
-                .unwrap_or(4)
-        })
+        // Immer die maximale Anzahl CPU-Kerne verwenden, unabhängig von Config
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
+    
+    /// Gibt die maximale Anzahl verfügbarer CPU-Kerne zurück
+    /// 
+    /// Diese Methode ignoriert Config-Einstellungen und gibt immer die maximale Anzahl zurück.
+    /// Wird verwendet, wenn explizit die maximale Anzahl benötigt wird.
+    /// 
+    /// Für normale Verwendung sollte `jobs()` verwendet werden, die Config-Einstellungen respektiert.
+    #[allow(dead_code)]
+    pub fn max_jobs(&self) -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     }
     
     /// Gibt den Pfad zur Index-Datenbank zurück
