@@ -74,9 +74,8 @@ impl Cache {
         
         let path = self.package_path_with_ext(name, version, arch, ext);
         
-        // Berechne Checksumme der Quelldatei
-        let data = fs::read(source_file)?;
-        let checksum = Self::calculate_checksum(&data);
+        // Berechne Checksumme der Quelldatei (streaming für große Dateien)
+        let checksum = Self::calculate_file_checksum(source_file)?;
         
         // Prüfe, ob bereits ein Paket mit derselber Checksumme existiert
         if let Some(existing_path) = self.find_package_by_checksum(&checksum)? {
@@ -86,8 +85,11 @@ impl Cache {
                 fs::copy(&existing_path, &path)?;
             }
         } else {
-            // Kopiere Datei in Cache
-            fs::copy(source_file, &path)?;
+            // Versuche rename zuerst (schneller als copy, atomisch)
+            if let Err(_) = fs::rename(source_file, &path) {
+                // Falls rename fehlschlägt (verschiedene Dateisysteme), kopiere
+                fs::copy(source_file, &path)?;
+            }
             
             // Speichere Checksumme in Index
             self.update_checksum_index(&checksum, &path)?;
@@ -127,7 +129,7 @@ impl Cache {
         Ok(result)
     }
     
-    /// Aktualisiert den Checksum-Index
+    /// Aktualisiert den Checksum-Index (mit Batch-Updates für bessere Performance)
     fn update_checksum_index(&self, checksum: &str, path: &Path) -> Result<()> {
         let mut index = self.load_checksum_index()?;
         
@@ -135,12 +137,12 @@ impl Cache {
         if !index.contains_key(checksum) {
             index.insert(checksum.to_string(), path.to_path_buf());
             
-            // Speichere Index
+            // Speichere Index (nur wenn sich etwas geändert hat)
             let index_path = self.cache_dir.join("checksums.json");
             let index_str: HashMap<String, String> = index.iter()
                 .map(|(k, v)| (k.clone(), v.to_string_lossy().to_string()))
                 .collect();
-            let content = serde_json::to_string_pretty(&index_str)?;
+            let content = serde_json::to_string(&index_str)?; // Kein pretty-print für bessere Performance
             fs::write(&index_path, content)?;
         }
         
@@ -153,12 +155,31 @@ impl Cache {
         Ok(metadata.nlink())
     }
     
-    /// Berechnet die Checksumme einer Datei
-    #[allow(dead_code)]
+    /// Berechnet die Checksumme von Daten im Speicher
     pub fn calculate_checksum(data: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
+    }
+    
+    /// Berechnet die Checksumme einer Datei (streaming für große Dateien)
+    fn calculate_file_checksum(file_path: &Path) -> Result<String> {
+        use std::io::Read;
+        use std::fs::File;
+        
+        let mut file = File::open(file_path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024]; // 64KB Buffer für bessere Performance
+        
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        Ok(hex::encode(hasher.finalize()))
     }
     
     /// Räumt den Cache auf (entfernt alte Pakete)

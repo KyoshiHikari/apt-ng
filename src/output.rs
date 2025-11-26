@@ -120,10 +120,11 @@ impl Output {
         let pb = ProgressBar::new(len);
         
         // Use different styles based on terminal capabilities
+        // Include speed in the template
         let template = if Self::colors_enabled() {
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({percent}%) {msg}"
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}"
         } else {
-            "[{elapsed_precise}] [{bar:40}] {pos}/{len} ({percent}%) {msg}"
+            "[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({percent}%) {msg}"
         };
         
         pb.set_style(

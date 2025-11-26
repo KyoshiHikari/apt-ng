@@ -16,7 +16,58 @@ impl Index {
         let conn = Connection::open(db_path)?;
         let index = Index { conn };
         index.init_schema()?;
+        index.optimize_for_bulk_inserts()?;
         Ok(index)
+    }
+    
+    /// Optimiert SQLite für Bulk-Inserts (schnelleres Indexing)
+    fn optimize_for_bulk_inserts(&self) -> SqliteResult<()> {
+        // WAL-Mode für bessere Concurrency und Performance
+        // Verwende execute_batch für PRAGMA-Befehle, die Werte zurückgeben können
+        self.conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA cache_size = -10000;"
+        )?;
+        
+        // Deaktiviere Foreign Keys während Bulk-Inserts (wird später wieder aktiviert)
+        // self.conn.execute("PRAGMA foreign_keys = OFF", [])?; // Nur wenn nötig
+        
+        // Erhöhe Page Size für bessere Performance bei großen Datenmengen
+        // self.conn.execute("PRAGMA page_size = 4096", [])?; // Nur beim Erstellen der DB
+        
+        Ok(())
+    }
+    
+    /// Aktiviert Bulk-Insert-Modus (deaktiviert Indizes temporär)
+    pub fn begin_bulk_insert(&self) -> Result<()> {
+        // Deaktiviere Indizes temporär für schnelleres Inserting
+        self.conn.execute("DROP INDEX IF EXISTS idx_packages_name", [])?;
+        self.conn.execute("DROP INDEX IF EXISTS idx_packages_timestamp", [])?;
+        
+        // Setze synchronous auf OFF für maximale Geschwindigkeit während Bulk-Inserts
+        // Verwende execute_batch für PRAGMA-Befehle
+        self.conn.execute_batch("PRAGMA synchronous = OFF")?;
+        
+        Ok(())
+    }
+    
+    /// Beendet Bulk-Insert-Modus (reaktiviert Indizes)
+    pub fn end_bulk_insert(&self) -> Result<()> {
+        // Reaktiviere synchronous
+        // Verwende execute_batch für PRAGMA-Befehle
+        self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        
+        // Reaktiviere Indizes
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_packages_timestamp ON packages(timestamp)",
+            [],
+        )?;
+        
+        Ok(())
     }
     
     /// Initialisiert das Datenbank-Schema
@@ -152,6 +203,25 @@ impl Index {
     
     /// Fügt mehrere Pakete in einer Transaktion hinzu (für bessere Performance)
     pub fn add_packages_batch(&self, manifests: &[PackageManifest], repo_id: i64) -> Result<()> {
+        // Serialisiere JSON-Daten vorher für bessere Performance
+        let serialized_data: Vec<(String, String, String, String, String, i64, String, i64, i64, String)> = manifests
+            .iter()
+            .map(|manifest| {
+                (
+                    manifest.name.clone(),
+                    manifest.version.clone(),
+                    manifest.arch.clone(),
+                    serde_json::to_string(&manifest.provides).unwrap_or_default(),
+                    serde_json::to_string(&manifest.depends).unwrap_or_default(),
+                    manifest.size as i64,
+                    manifest.checksum.clone(),
+                    repo_id,
+                    manifest.timestamp,
+                    manifest.filename.as_deref().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        
         let tx = self.conn.unchecked_transaction()?;
         
         {
@@ -160,18 +230,18 @@ impl Index {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
             )?;
             
-            for manifest in manifests {
+            for (name, version, arch, provides, depends, size, checksum, repo_id_val, timestamp, filename) in serialized_data {
                 stmt.execute(rusqlite::params![
-                    manifest.name,
-                    manifest.version,
-                    manifest.arch,
-                    serde_json::to_string(&manifest.provides).unwrap_or_default(),
-                    serde_json::to_string(&manifest.depends).unwrap_or_default(),
-                    manifest.size as i64,
-                    manifest.checksum,
-                    repo_id,
-                    manifest.timestamp,
-                    manifest.filename.as_deref().unwrap_or(""),
+                    name,
+                    version,
+                    arch,
+                    provides,
+                    depends,
+                    size,
+                    checksum,
+                    repo_id_val,
+                    timestamp,
+                    filename,
                 ])?;
             }
         }

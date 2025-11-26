@@ -3,6 +3,7 @@ use reqwest::Client;
 use std::path::Path;
 use tokio::io::{AsyncWriteExt, AsyncSeekExt};
 use futures::stream::{self, StreamExt};
+use std::time::Instant;
 
 pub struct Downloader {
     pub client: Client,
@@ -134,10 +135,51 @@ impl Downloader {
             return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
         }
         
+        // Get content length for progress bar
+        let total_size = response.content_length();
+        let progress_bar = if let Some(size) = total_size {
+            Some(crate::output::Output::progress_bar(size))
+        } else {
+            None
+        };
+        
         let mut file = tokio::fs::File::create(dest).await?;
+        
+        let mut downloaded = 0u64;
+        let mut last_update = Instant::now();
+        let mut last_downloaded = 0u64;
+        let update_interval = std::time::Duration::from_millis(100); // Update every 100ms
         
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            
+            // Update progress bar with speed
+            if let Some(ref pb) = progress_bar {
+                pb.set_position(downloaded);
+                
+                // Calculate and display speed
+                let elapsed = last_update.elapsed();
+                if elapsed >= update_interval {
+                    let bytes_since_update = downloaded - last_downloaded;
+                    let speed = if elapsed.as_secs() > 0 {
+                        bytes_since_update / elapsed.as_secs()
+                    } else if elapsed.as_millis() > 0 {
+                        bytes_since_update * 1000 / elapsed.as_millis() as u64
+                    } else {
+                        0
+                    };
+                    
+                    let speed_str = Self::format_speed(speed);
+                    pb.set_message(format!("{}", speed_str));
+                    last_update = Instant::now();
+                    last_downloaded = downloaded;
+                }
+            }
+        }
+        
+        if let Some(ref pb) = progress_bar {
+            pb.finish_with_message("Done");
         }
         
         // Validate checksum if provided
@@ -182,16 +224,47 @@ impl Downloader {
             return Err(anyhow::anyhow!("HTTP error for resume: {}", response.status()));
         }
         
+        // Show progress bar for resume
+        let progress_bar = crate::output::Output::progress_bar(total_size);
+        progress_bar.set_position(existing_size);
+        
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .append(true)
             .open(dest)
             .await?;
         
+        let mut downloaded = existing_size;
+        let mut last_update = Instant::now();
+        let mut last_downloaded = existing_size;
+        let update_interval = std::time::Duration::from_millis(100);
+        
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            
+            // Update progress bar with speed
+            progress_bar.set_position(downloaded);
+            
+            let elapsed = last_update.elapsed();
+            if elapsed >= update_interval {
+                let bytes_since_update = downloaded - last_downloaded;
+                let speed = if elapsed.as_secs() > 0 {
+                    bytes_since_update / elapsed.as_secs()
+                } else if elapsed.as_millis() > 0 {
+                    bytes_since_update * 1000 / elapsed.as_millis() as u64
+                } else {
+                    0
+                };
+                
+                let speed_str = Self::format_speed(speed);
+                progress_bar.set_message(format!("{}", speed_str));
+                last_update = Instant::now();
+                last_downloaded = downloaded;
+            }
         }
         
+        progress_bar.finish_with_message("Done");
         Ok(())
     }
     
@@ -253,6 +326,17 @@ impl Downloader {
         }
         
         Ok(())
+    }
+    
+    /// Format download speed as human-readable string
+    fn format_speed(bytes_per_sec: u64) -> String {
+        if bytes_per_sec >= 1024 * 1024 {
+            format!("{:.2} MB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
+        } else if bytes_per_sec >= 1024 {
+            format!("{:.2} KB/s", bytes_per_sec as f64 / 1024.0)
+        } else {
+            format!("{} B/s", bytes_per_sec)
+        }
     }
     
     /// Validiert die SHA256-Checksumme einer Datei

@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 /// Parst eine apt Packages-Datei
 pub fn parse_packages_file(content: &str) -> Result<Vec<PackageManifest>> {
-    let mut packages = Vec::new();
+    // Schätze Anzahl der Pakete basierend auf Dateigröße für bessere Performance
+    let estimated_packages = content.len() / 500; // Grobe Schätzung: ~500 Bytes pro Paket
+    let mut packages = Vec::with_capacity(estimated_packages);
     let mut current_pkg: Option<HashMap<String, String>> = None;
     
     for line in content.lines() {

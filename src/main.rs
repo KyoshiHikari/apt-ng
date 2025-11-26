@@ -362,8 +362,15 @@ async fn cmd_update(index: &index::Index, config: &config::Config, jobs: usize, 
                                     // Verwende Batch-Insert für bessere Performance
                                     let repo_id = repo.id.unwrap_or(1);
                                     
-                                    // Teile in Batches von 1000 Paketen auf
-                                    const BATCH_SIZE: usize = 1000;
+                                    // Aktiviere Bulk-Insert-Modus für maximale Performance
+                                    if let Err(e) = index.begin_bulk_insert() {
+                                        if verbose {
+                                            output::Output::warning(&format!("Failed to enable bulk insert mode: {}", e));
+                                        }
+                                    }
+                                    
+                                    // Teile in Batches von 5000 Paketen auf (größere Batches = bessere Performance)
+                                    const BATCH_SIZE: usize = 5000;
                                     let mut batch_errors = 0;
                                     for (batch_idx, chunk) in packages.chunks(BATCH_SIZE).enumerate() {
                                         match index.add_packages_batch(chunk, repo_id) {
@@ -391,6 +398,13 @@ async fn cmd_update(index: &index::Index, config: &config::Config, jobs: usize, 
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                    
+                                    // Deaktiviere Bulk-Insert-Modus und reaktiviere Indizes
+                                    if let Err(e) = index.end_bulk_insert() {
+                                        if verbose {
+                                            output::Output::warning(&format!("Failed to end bulk insert mode: {}", e));
                                         }
                                     }
                                     
@@ -605,15 +619,35 @@ async fn cmd_install(
                     false
                 };
                 
-                // Also check checksum if available
+                // Also check checksum if available (streaming für große Dateien)
                 let checksum_valid = if !pkg.checksum.is_empty() {
                     use sha2::{Sha256, Digest};
                     use hex;
-                    if let Ok(package_data) = std::fs::read(&cache_path_deb) {
+                    use std::io::Read;
+                    use std::fs::File;
+                    
+                    if let Ok(mut file) = File::open(&cache_path_deb) {
                         let mut hasher = Sha256::new();
-                        hasher.update(&package_data);
-                        let calculated_checksum = hex::encode(hasher.finalize());
-                        calculated_checksum == pkg.checksum
+                        let mut buffer = vec![0u8; 64 * 1024]; // 64KB Buffer
+                        
+                        let mut read_ok = true;
+                        loop {
+                            match file.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(n) => hasher.update(&buffer[..n]),
+                                Err(_) => {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if read_ok {
+                            let calculated_checksum = hex::encode(hasher.finalize());
+                            calculated_checksum == pkg.checksum
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
@@ -741,14 +775,25 @@ async fn cmd_install(
                     }
                 }
             } else {
-                // Für .deb-Pakete: Verifiziere Checksumme
-                let package_data = std::fs::read(&cache_path)?;
-                
+                // Für .deb-Pakete: Verifiziere Checksumme (streaming für große Dateien)
                 if !pkg.checksum.is_empty() {
                     use sha2::{Sha256, Digest};
                     use hex;
+                    use std::io::Read;
+                    use std::fs::File;
+                    
+                    let mut file = File::open(&cache_path)?;
                     let mut hasher = Sha256::new();
-                    hasher.update(&package_data);
+                    let mut buffer = vec![0u8; 64 * 1024]; // 64KB Buffer
+                    
+                    loop {
+                        let bytes_read = file.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..bytes_read]);
+                    }
+                    
                     let calculated_checksum = hex::encode(hasher.finalize());
                     
                     if calculated_checksum != pkg.checksum {
