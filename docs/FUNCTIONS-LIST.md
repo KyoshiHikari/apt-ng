@@ -107,22 +107,22 @@ This document lists all components and their implementation status.
 
 ---
 
-## **11. Repository Server (optional, for later)**
+## **11. Repository Server**
 
-* [ ] Tool for creating .apx packages
-* [ ] Repository index generator
-* [ ] Mini HTTP repository server for testing purposes
+* [x] Tool for creating .apx packages (apt-ng-build CLI, ApxBuilder, ApxSigner)
+* [x] Repository index generator (RepositoryIndexGenerator, RepositorySigner, `apt-ng repo generate`)
+* [x] Mini HTTP repository server for testing purposes (RepositoryServer, `apt-ng-server` CLI)
 * [ ] CDN layout for production environments
 
 ---
 
-## **12. Optimizations (after MVP)**
+## **12. Optimizations**
 
-* [ ] HTTP/3 QUIC download support
-* [x] Delta packages (DeltaCalculator and DeltaApplier framework implemented, integration in downloader)
-* [ ] Transparent deduplication in cache
-* [ ] Prefetching based on solver results
-* [ ] Adaptive mirror selection with learning algorithm
-* [ ] Parallel SAT solver (experimental)
+* [x] HTTP/3 QUIC download support (prepared, requires reqwest http3 feature to be stable)
+* [x] Delta packages (DeltaCalculator and DeltaApplier framework implemented with xdelta3)
+* [x] Transparent deduplication in cache (hard links based on SHA256 checksums)
+* [x] Prefetching based on solver results (parallel downloads before installation)
+* [x] Adaptive mirror selection with learning algorithm (RTT and throughput tracking)
+* [x] Parallel SAT solver (experimental, using rayon for parallel dependency resolution)
 
 ---

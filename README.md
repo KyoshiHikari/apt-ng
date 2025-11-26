@@ -122,22 +122,53 @@ CLI -> Core Engine ->
 ```
 apt-ng/
 ├── src/
-│   ├── main.rs          # CLI Entry Point
-│   ├── cli.rs           # CLI Parsing
-│   ├── config.rs        # Configuration Management
-│   ├── index.rs         # SQLite Index
-│   ├── downloader.rs    # HTTP Downloader
-│   ├── verifier.rs      # Signature Verification
-│   ├── installer.rs     # Package Installation
-│   ├── package.rs       # Package Format Handling
-│   ├── repo.rs          # Repository Management
-│   ├── solver.rs        # Dependency Solver
-│   ├── cache.rs         # Cache Management
-│   ├── apt_parser.rs    # APT Packages Parser
-│   ├── system.rs        # System Detection
-│   └── output.rs        # Formatted Output
+│   ├── main.rs              # CLI Entry Point
+│   ├── lib.rs               # Library Exports
+│   ├── cli.rs               # CLI Parsing
+│   ├── config.rs            # Configuration Management
+│   ├── index.rs             # SQLite Index
+│   ├── downloader.rs        # HTTP Downloader (HTTP/2, HTTP/3 QUIC ready)
+│   ├── verifier.rs          # Signature Verification
+│   ├── installer.rs         # Package Installation
+│   ├── package.rs           # Package Format Handling (.deb, .apx)
+│   ├── repo.rs              # Repository Management
+│   ├── solver.rs            # Dependency Solver (with parallel solving)
+│   ├── cache.rs             # Cache Management (with deduplication)
+│   ├── apt_parser.rs        # APT Packages Parser
+│   ├── system.rs            # System Detection
+│   ├── output.rs            # Formatted Output
+│   ├── sandbox.rs           # Sandbox for install scripts (Bubblewrap)
+│   ├── delta/               # Delta Updates
+│   │   ├── mod.rs
+│   │   ├── calculator.rs    # Delta calculation (xdelta3)
+│   │   ├── applier.rs       # Delta application
+│   │   └── format.rs        # Delta metadata
+│   ├── benchmark/           # Benchmarking Framework
+│   │   ├── mod.rs
+│   │   ├── metrics.rs       # Performance metrics collection
+│   │   └── output.rs        # Benchmark output formatting
+│   ├── security/            # Security Analysis
+│   │   ├── mod.rs
+│   │   ├── audit.rs         # Security audit runner
+│   │   ├── checks.rs        # Individual security checks
+│   │   └── report.rs        # Security report generation
+│   ├── apx_builder/         # APX Package Builder
+│   │   ├── mod.rs
+│   │   ├── builder.rs       # Package building
+│   │   └── signer.rs        # Package signing (Ed25519)
+│   ├── repo_generator/      # Repository Index Generator
+│   │   ├── mod.rs
+│   │   ├── index.rs         # Packages/Release file generation
+│   │   └── signature.rs     # Repository signing
+│   ├── repo_server/         # HTTP Repository Server
+│   │   ├── mod.rs
+│   │   └── server.rs        # Mini HTTP server for repositories
+│   └── bin/                 # Binary Tools
+│       ├── apt-ng-benchmark.rs  # Benchmarking tool
+│       ├── apt-ng-build.rs      # Package builder CLI
+│       └── apt-ng-server.rs     # Repository server CLI
 ├── docs/
-│   └── FUNCTIONS-LIST.md # Feature Status
+│   └── FUNCTIONS-LIST.md    # Feature Status
 └── Cargo.toml
 ```
 
@@ -153,7 +184,9 @@ See [FUNCTIONS-LIST.md](docs/FUNCTIONS-LIST.md) for the current implementation s
 
 ### Implemented Features ✅
 
+**Core Features:**
 - [x] Full Dependency Solver with version constraints and conflict detection
+- [x] Parallel SAT Solver using rayon for improved performance
 - [x] Atomic Moves for Installations with rollback support
 - [x] Rollback Mechanism for failed installations
 - [x] Range-Requests for Chunk Downloads
@@ -162,13 +195,28 @@ See [FUNCTIONS-LIST.md](docs/FUNCTIONS-LIST.md) for the current implementation s
 - [x] Repository and Package Signature Verification (Ed25519)
 - [x] Checksum validation during downloads and extraction
 - [x] Pre/post install hooks support
+- [x] Sandbox for install scripts (Bubblewrap integration)
+
+**Performance Optimizations:**
+- [x] HTTP/3 QUIC support (prepared, requires reqwest http3 feature)
+- [x] Cache deduplication using hard links
+- [x] Prefetching for parallel package downloads
+- [x] Adaptive mirror selection with performance tracking
+- [x] Delta updates framework (xdelta3 integration)
+
+**Developer Tools:**
+- [x] Integration Tests with local test repository
+- [x] Benchmarking tools against apt-get (`apt-ng-benchmark`)
+- [x] Fuzzing for package format parsers
+- [x] Security analysis (Signatures & Hook Sandbox)
+- [x] APX Package Builder (`apt-ng-build`)
+- [x] Repository Index Generator (`apt-ng repo generate`)
+- [x] Mini HTTP Repository Server (`apt-ng-server`)
 
 ### Planned Features
 
-- [ ] Integration Tests with local test repository
-- [ ] Benchmarking tools against apt-get
-- [ ] Fuzzing for package format parsers
-- [ ] Security analysis (Signatures & Hook Sandbox)
+- [ ] CDN layout for production environments
+- [ ] Additional optimization algorithms
 
 ## 🤝 Contributing
 
