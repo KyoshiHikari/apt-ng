@@ -181,6 +181,20 @@ pub enum Commands {
     ///   $ apt-ng security audit --json
     #[command(subcommand)]
     Security(SecurityCommands),
+    
+    /// Update apt-ng to the latest version
+    ///
+    /// Checks GitHub Releases for newer versions and automatically
+    /// downloads and installs the update if available.
+    ///
+    /// Examples:
+    ///   $ apt-ng self-update
+    ///   $ apt-ng self-update --force  # Force update even if same version
+    SelfUpdate {
+        /// Force update even if already on latest version
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]

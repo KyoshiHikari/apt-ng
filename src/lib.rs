@@ -18,4 +18,5 @@ pub mod delta;
 pub mod apx_builder;
 pub mod repo_generator;
 pub mod repo_server;
+pub mod self_update;
 

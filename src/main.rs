@@ -15,6 +15,7 @@ mod sandbox;
 mod security;
 mod delta;
 mod repo_generator;
+mod self_update;
 
 use cli::{Commands, RepoCommands, CacheAction, SecurityCommands};
 use std::path::Path;
@@ -52,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
     
     let opts = cli::parse();
     
+    // Check for updates in background (non-blocking)
+    // Skip check for self-update command to avoid recursion
+    let check_updates = !matches!(&opts.command, Commands::SelfUpdate { .. });
+    
     // Load configuration
     let config = config::Config::load(None)?;
     
@@ -74,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
     
     // Initialisiere Index
     let index = index::Index::new(config.index_db_path().to_str().unwrap())?;
+    
+    // Check for updates in background (non-blocking)
+    if check_updates {
+        check_for_updates_background();
+    }
     
     // Führe Command aus
     match &opts.command {
@@ -121,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
                     cmd_security_audit(&format, opts.verbose)?;
                 }
             }
+        }
+        Commands::SelfUpdate { force } => {
+            cmd_self_update(*force, opts.verbose).await?;
         }
     }
     
@@ -1284,4 +1297,164 @@ fn cmd_security_audit(format: &str, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check for updates in background and display message if available
+fn check_for_updates_background() {
+    // Spawn a background task to check for updates
+    tokio::spawn(async {
+        if let Ok(updater) = self_update::SelfUpdater::new() {
+            if let Some(update_available) = updater.quick_check_update_available().await {
+                if update_available {
+                    output::Output::warning("A new version of apt-ng is available!");
+                    output::Output::info("Run 'apt-ng self-update' to update.");
+                }
+            }
+        }
+    });
+}
+
+async fn cmd_self_update(force: bool, verbose: bool) -> anyhow::Result<()> {
+    output::Output::heading("🔄 Checking for Updates");
+    
+    let updater = self_update::SelfUpdater::new()?;
+    let current_version = self_update::SelfUpdater::get_current_version();
+    let current_checksum = self_update::SelfUpdater::get_current_binary_checksum()?;
+    
+    if verbose {
+        output::Output::info(&format!("Current version: {}", current_version));
+        output::Output::info(&format!("Current binary SHA256: {}", &current_checksum[..16]));
+    }
+    
+    output::Output::info("Checking GitHub Releases for updates...");
+    
+    let release = updater.check_for_latest_version().await?;
+    let latest_version = release.tag_name.trim_start_matches('v');
+    
+    if verbose {
+        output::Output::info(&format!("Latest version: {}", latest_version));
+        if let Some(body) = &release.body {
+            output::Output::info("Release notes:");
+            for line in body.lines().take(10) {
+                output::Output::list_item(line);
+            }
+        }
+    }
+    
+    // Detect architecture
+    let arch = self_update::SelfUpdater::get_architecture()?;
+    if verbose {
+        output::Output::info(&format!("Detected architecture: {}", arch));
+    }
+    
+    // Find asset for architecture
+    let asset = updater.find_asset_for_architecture(&release, &arch)
+        .ok_or_else(|| anyhow::anyhow!(
+            "No binary found for architecture: {}. Available assets: {}",
+            arch,
+            release.assets.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+    
+    // Check SHA256 checksum first
+    let update_needed = if let Some(latest_checksum) = updater.get_latest_binary_checksum(asset).await? {
+        if verbose {
+            output::Output::info(&format!("Latest binary SHA256: {}", &latest_checksum[..16]));
+        }
+        let needs_update = current_checksum != latest_checksum;
+        if needs_update {
+            output::Output::section(&format!(
+                "Update available: {} -> {} (SHA256 differs)",
+                current_version,
+                latest_version
+            ));
+        } else if force {
+            output::Output::info("Binary checksums match, but --force specified. Updating anyway...");
+        } else {
+            output::Output::success("Already on latest version (SHA256 matches)!");
+            return Ok(());
+        }
+        needs_update || force
+    } else {
+        // Fallback to version comparison if checksum not available
+        let comparison = self_update::SelfUpdater::compare_versions(&current_version, latest_version);
+        
+        match comparison {
+            std::cmp::Ordering::Less => {
+                output::Output::section(&format!(
+                    "Update available: {} -> {}",
+                    current_version,
+                    latest_version
+                ));
+                true
+            }
+            std::cmp::Ordering::Equal => {
+                if force {
+                    output::Output::info("Already on latest version, but --force specified. Updating anyway...");
+                    true
+                } else {
+                    output::Output::success("Already on latest version!");
+                    return Ok(());
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                if force {
+                    output::Output::warning(&format!(
+                        "Current version ({}) is newer than latest release ({}). --force specified, updating anyway...",
+                        current_version,
+                        latest_version
+                    ));
+                    true
+                } else {
+                    output::Output::info(&format!(
+                        "Current version ({}) is newer than latest release ({}). No update needed.",
+                        current_version,
+                        latest_version
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+    };
+    
+    if !update_needed && !force {
+        return Ok(());
+    }
+    
+    output::Output::info(&format!("Found binary: {} ({})", asset.name, format_size(asset.size)));
+    
+    // Download binary
+    let temp_dir = std::env::temp_dir();
+    let archive_path = temp_dir.join(&asset.name);
+    let binary_path = temp_dir.join("apt-ng-new");
+    
+    updater.download_binary(asset, &archive_path, verbose).await?;
+    
+    // Extract if needed
+    if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz") {
+        if verbose {
+            output::Output::info("Extracting archive...");
+        }
+        updater.extract_binary(&archive_path, &binary_path)?;
+        // Clean up archive
+        let _ = std::fs::remove_file(&archive_path);
+    } else {
+        // Binary is not archived, just rename
+        std::fs::rename(&archive_path, &binary_path)?;
+    }
+    
+    // Install binary
+    updater.install_binary(&binary_path, verbose)?;
+    
+    // Clean up temporary binary
+    let _ = std::fs::remove_file(&binary_path);
+    
+    output::Output::success(&format!(
+        "Successfully updated apt-ng from {} to {}!",
+        current_version,
+        latest_version
+    ));
+    
+    Ok(())
+}
 
