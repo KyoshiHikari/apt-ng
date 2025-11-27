@@ -51,11 +51,46 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     
-    let opts = cli::parse();
+    // Start update check early (before parsing, so it runs even if help is shown)
+    // Check if this is a self-update command by checking args first
+    let args: Vec<String> = std::env::args().collect();
+    let is_self_update = args.len() > 1 && args[1] == "self-update";
+    
+    let update_check_handle = if !is_self_update {
+        Some(check_for_updates_background())
+    } else {
+        None
+    };
+    
+    // Parse CLI arguments - use try_parse to catch errors without exiting
+    let opts = match cli::try_parse() {
+        Ok(opts) => opts,
+        Err(e) => {
+            // If parsing fails (e.g., no command), show help and wait for update check
+            e.print().unwrap();
+            if let Some(handle) = update_check_handle {
+                // Wait longer (up to 6 seconds) to ensure update check completes
+                // The quick_check_update_available has a 5 second timeout
+                tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+                // Try to await the handle to ensure it completes
+                let _ = handle.await;
+            }
+            std::process::exit(2);
+        }
+    };
     
     // Check for updates in background (non-blocking)
     // Skip check for self-update command to avoid recursion
     let check_updates = !matches!(&opts.command, Commands::SelfUpdate { .. });
+    
+    // Use the handle we created earlier, or create a new one if needed
+    let final_update_check_handle = if let Some(handle) = update_check_handle {
+        Some(handle)
+    } else if check_updates {
+        Some(check_for_updates_background())
+    } else {
+        None
+    };
     
     // Load configuration
     let config = config::Config::load(None)?;
@@ -79,11 +114,6 @@ async fn main() -> anyhow::Result<()> {
     
     // Initialisiere Index
     let index = index::Index::new(config.index_db_path().to_str().unwrap())?;
-    
-    // Check for updates in background (non-blocking)
-    if check_updates {
-        check_for_updates_background();
-    }
     
     // Führe Command aus
     match &opts.command {
@@ -141,6 +171,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::SelfUpdate { force } => {
             cmd_self_update(*force, opts.verbose).await?;
         }
+    }
+    
+    // Wait for update check to complete and display message if update available
+    if let Some(handle) = final_update_check_handle {
+        // Wait longer (up to 6 seconds) to ensure update check completes
+        // The quick_check_update_available has a 5 second timeout
+        tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        // Try to await the handle to ensure it completes
+        let _ = handle.await;
     }
     
     Ok(())
@@ -1358,18 +1397,28 @@ fn cmd_security_audit(format: &str, verbose: bool) -> anyhow::Result<()> {
 }
 
 /// Check for updates in background and display message if available
-fn check_for_updates_background() {
+/// Returns a handle that can be awaited (though we don't wait for it to complete)
+fn check_for_updates_background() -> tokio::task::JoinHandle<()> {
     // Spawn a background task to check for updates
     tokio::spawn(async {
+        // Small delay to ensure main command output is shown first
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        
         if let Ok(updater) = self_update::SelfUpdater::new() {
             if let Some(update_available) = updater.quick_check_update_available().await {
                 if update_available {
-                    output::Output::warning("A new version of apt-ng is available!");
-                    output::Output::info("Run 'apt-ng self-update' to update.");
+                    // Use eprintln! to stderr to ensure message is shown even if stdout is redirected
+                    // Also flush to ensure message appears immediately
+                    eprintln!();
+                    eprintln!("⚠️  A new version of apt-ng is available!");
+                    eprintln!("   Run 'apt-ng self-update' to update.");
+                    eprintln!();
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
                 }
             }
         }
-    });
+    })
 }
 
 async fn cmd_self_update(force: bool, verbose: bool) -> anyhow::Result<()> {

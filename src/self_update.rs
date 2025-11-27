@@ -22,6 +22,8 @@ pub struct ReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
     pub size: u64,
+    #[serde(default)]
+    pub digest: Option<String>, // GitHub provides SHA256 digest in format "sha256:hash"
 }
 
 pub struct SelfUpdater {
@@ -58,7 +60,20 @@ impl SelfUpdater {
 
     /// Get SHA256 checksum from GitHub release (from release notes or checksums file)
     pub async fn get_latest_binary_checksum(&self, asset: &ReleaseAsset) -> Result<Option<String>> {
-        // First, try to find a checksums file in the release assets
+        // First, try to get checksum from asset digest (GitHub API provides this)
+        if let Some(ref digest) = asset.digest {
+            // Format is "sha256:hash" or just "hash"
+            if digest.starts_with("sha256:") {
+                let hash = digest.strip_prefix("sha256:").unwrap();
+                if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Ok(Some(hash.to_string()));
+                }
+            } else if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(Some(digest.to_string()));
+            }
+        }
+        
+        // Second, try to find a checksums file in the release assets
         let release = self.check_for_latest_version().await?;
         
         // Look for checksums.txt or SHA256SUMS file
@@ -73,16 +88,27 @@ impl SelfUpdater {
                 if response.status().is_success() {
                     let checksums_text = response.text().await?;
                     
-                    // Parse checksums file (format: SHA256  filename)
+                    // Parse checksums file (format: SHA256  filename or SHA256 *filename)
                     for line in checksums_text.lines() {
-                        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        
+                        let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() >= 2 {
                             let checksum = parts[0];
-                            let filename = parts[1];
+                            // Filename might be prefixed with * or space
+                            let filename = parts[1].trim_start_matches('*').trim_start();
                             
-                            // Check if this checksum matches our asset
-                            if filename == asset.name || filename.contains(&asset.name) {
-                                return Ok(Some(checksum.to_string()));
+                            // Check if this checksum matches our asset (exact match or contains)
+                            if filename == asset.name || 
+                               filename.contains(&asset.name) || 
+                               asset.name.contains(filename) {
+                                // Validate checksum format
+                                if checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()) {
+                                    return Ok(Some(checksum.to_string()));
+                                }
                             }
                         }
                     }
@@ -94,12 +120,14 @@ impl SelfUpdater {
         if let Some(body) = &release.body {
             // Look for SHA256 checksum in release notes (format: SHA256: abc123...)
             for line in body.lines() {
-                if line.contains("SHA256") || line.contains("sha256") {
+                let line_lower = line.to_lowercase();
+                if line_lower.contains("sha256") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     for part in parts {
                         // Check if this looks like a SHA256 hash (64 hex characters)
-                        if part.len() == 64 && part.chars().all(|c| c.is_ascii_hexdigit()) {
-                            return Ok(Some(part.to_string()));
+                        let part_clean = part.trim_matches(|c: char| !c.is_ascii_hexdigit());
+                        if part_clean.len() == 64 && part_clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                            return Ok(Some(part_clean.to_string()));
                         }
                     }
                 }
@@ -133,10 +161,21 @@ impl SelfUpdater {
     pub async fn quick_check_update_available(&self) -> Option<bool> {
         use tokio::time::{timeout, Duration};
         
-        // Set a short timeout (2 seconds) to avoid blocking
-        match timeout(Duration::from_secs(2), self.check_update_available()).await {
+        // Set a longer timeout (5 seconds) to give GitHub API more time
+        match timeout(Duration::from_secs(5), self.check_update_available()).await {
             Ok(Ok(available)) => Some(available),
-            Ok(Err(_)) => None, // Error checking, don't show update message
+            Ok(Err(e)) => {
+                // Log error in debug mode but don't show to user
+                // Use the error to determine if we should retry or just ignore
+                let error_msg = format!("{}", e);
+                #[cfg(debug_assertions)]
+                eprintln!("Update check error: {}", error_msg);
+                // For network errors, we might want to retry, but for now just ignore
+                if error_msg.contains("timeout") || error_msg.contains("network") {
+                    // Network issues - silently ignore
+                }
+                None // Error checking, don't show update message
+            }
             Err(_) => None, // Timeout, don't block
         }
     }

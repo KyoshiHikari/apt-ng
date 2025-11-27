@@ -290,8 +290,9 @@ pub enum CacheAction {
     },
 }
 
-pub fn parse() -> Cli {
-    Cli::parse()
+/// Try to parse CLI arguments without exiting on error
+pub fn try_parse() -> Result<Cli, clap::Error> {
+    Cli::try_parse()
 }
 
 /// Generate shell completion scripts
